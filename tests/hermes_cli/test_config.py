@@ -8,8 +8,10 @@ from hermes_cli.config import (
     DEFAULT_CONFIG,
     get_hermes_home,
     ensure_hermes_home,
+    get_env_value,
     load_config,
     save_config,
+    set_config_value,
 )
 
 
@@ -66,3 +68,18 @@ class TestSaveAndLoadRoundtrip:
 
             reloaded = load_config()
             assert reloaded["terminal"]["timeout"] == 999
+
+
+class TestSetConfigValueRouting:
+    def test_hyperliquid_secret_routes_to_env(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            set_config_value("HYPERLIQUID_SECRET_KEY", "0xabc123")
+            assert get_env_value("HYPERLIQUID_SECRET_KEY") == "0xabc123"
+            cfg = load_config()
+            assert "HYPERLIQUID_SECRET_KEY" not in cfg
+
+    def test_regular_key_routes_to_config_yaml(self, tmp_path):
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            set_config_value("model", "test/model")
+            cfg = load_config()
+            assert cfg["model"] == "test/model"

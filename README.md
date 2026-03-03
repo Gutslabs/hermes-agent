@@ -191,6 +191,7 @@ The `hermes config set` command automatically routes values to the right file â€
 | Web scraping | [Firecrawl](https://firecrawl.dev/) | `FIRECRAWL_API_KEY` |
 | Browser automation | [Browserbase](https://browserbase.com/) | `BROWSERBASE_API_KEY`, `BROWSERBASE_PROJECT_ID` |
 | Image generation | [FAL](https://fal.ai/) | `FAL_KEY` |
+| Hyperliquid trading (guarded) | [Hyperliquid](https://hyperliquid.gitbook.io/hyperliquid-docs) | `HYPERLIQUID_ACCOUNT_ADDRESS`, `HYPERLIQUID_SECRET_KEY`, `HYPERLIQUID_NETWORK` |
 | Premium TTS voices | [ElevenLabs](https://elevenlabs.io/) | `ELEVENLABS_API_KEY` |
 | OpenAI TTS + voice transcription | [OpenAI](https://platform.openai.com/api-keys) | `VOICE_TOOLS_OPENAI_KEY` |
 | RL Training | [Tinker](https://tinker-console.thinkingmachines.ai/) + [WandB](https://wandb.ai/) | `TINKER_API_KEY`, `WANDB_API_KEY` |
@@ -1392,6 +1393,9 @@ FIRECRAWL_API_KEY=fc-your-key          # Web search & scraping
 BROWSERBASE_API_KEY=bb-your-key        # Browser automation
 BROWSERBASE_PROJECT_ID=your-project-id # Browser automation
 FAL_KEY=your-fal-key                   # Image generation (FLUX)
+HYPERLIQUID_ACCOUNT_ADDRESS=0x...      # Hyperliquid main account address
+HYPERLIQUID_SECRET_KEY=0x...           # Hyperliquid API wallet private key
+HYPERLIQUID_NETWORK=testnet            # testnet or mainnet
 TINKER_API_KEY=your-tinker-key         # RL training
 WANDB_API_KEY=your-wandb-key           # RL training metrics
 
@@ -1633,6 +1637,14 @@ All variables go in `~/.hermes/.env`. Run `hermes config set VAR value` to set t
 | `BROWSERBASE_API_KEY` | Browser automation |
 | `BROWSERBASE_PROJECT_ID` | Browserbase project |
 | `FAL_KEY` | Image generation (fal.ai) |
+| `HYPERLIQUID_ACCOUNT_ADDRESS` | Hyperliquid account address (read + trading context) |
+| `HYPERLIQUID_SECRET_KEY` | Hyperliquid API wallet private key (signed trade actions) |
+| `HYPERLIQUID_NETWORK` | Hyperliquid network selection: `testnet` or `mainnet` |
+| `HYPERLIQUID_VAULT_ADDRESS` | Optional vault/subaccount address for trading actions |
+| `HYPERLIQUID_ALLOWED_COINS` | Optional CSV symbol allowlist for trading actions |
+| `HYPERLIQUID_MAX_NOTIONAL_USD` | Max per-action notional guardrail (USD, default: `1000`) |
+| `HYPERLIQUID_KILL_SWITCH` | Block all live actions when `true` (default: `true`) |
+| `HYPERLIQUID_MAINNET_ALLOW_DRY_RUN` | Allow dry-run previews on mainnet (`false` by default) |
 | `HONCHO_API_KEY` | Cross-session user modeling ([honcho.dev](https://honcho.dev/)) |
 
 **Terminal Backend:**

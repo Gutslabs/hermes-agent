@@ -27,6 +27,7 @@ dependencies = [
   # Tools
   "firecrawl-py",
   "fal-client",
+  "hyperliquid-python-sdk",
   # Text-to-speech (Edge TTS is free, no API key needed)
   "edge-tts",
   # mini-swe-agent deps (terminal tool)

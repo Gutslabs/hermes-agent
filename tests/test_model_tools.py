@@ -96,3 +96,7 @@ class TestBackwardCompat:
     def test_tool_to_toolset_map(self):
         assert isinstance(TOOL_TO_TOOLSET_MAP, dict)
         assert len(TOOL_TO_TOOLSET_MAP) > 0
+
+    def test_hyperliquid_tools_mapped_to_trading(self):
+        assert TOOL_TO_TOOLSET_MAP.get("hyperliquid_info") == "trading"
+        assert TOOL_TO_TOOLSET_MAP.get("hyperliquid_trade") == "trading"

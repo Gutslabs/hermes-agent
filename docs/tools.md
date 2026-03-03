@@ -45,6 +45,7 @@ async def web_search(query: str) -> dict:
 | **Vision** | `vision_tools.py` | `vision_analyze` |
 | **Image Gen** | `image_generation_tool.py` | `image_generate` |
 | **TTS** | `tts_tool.py` | `text_to_speech` (Edge TTS free / ElevenLabs / OpenAI) |
+| **Trading** | `hyperliquid_tool.py` | `hyperliquid_info`, `hyperliquid_trade` |
 | **Reasoning** | `mixture_of_agents_tool.py` | `mixture_of_agents` |
 | **Skills** | `skills_tool.py`, `skill_manager_tool.py` | `skills_list`, `skill_view`, `skill_manage` |
 | **Todo** | `todo_tool.py` | `todo` (read/write task list for multi-step planning) |
@@ -56,6 +57,8 @@ async def web_search(query: str) -> dict:
 | **Code Execution** | `code_execution_tool.py` | `execute_code` (run Python scripts that call tools via RPC sandbox) |
 | **Delegation** | `delegate_tool.py` | `delegate_task` (spawn subagents with isolated context, single + parallel batch) |
 | **MCP (External)** | `tools/mcp_tool.py` | Auto-discovered from configured MCP servers |
+
+Hyperliquid tool contract and guardrail model: `docs/hyperliquid_trading.md`.
 
 ## Tool Registration
 

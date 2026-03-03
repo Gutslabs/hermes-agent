@@ -155,6 +155,14 @@ from .delegate_tool import (
     DELEGATE_TASK_SCHEMA,
 )
 
+from .hyperliquid_tool import (
+    hyperliquid_info,
+    hyperliquid_trade,
+    check_hyperliquid_requirements,
+    HYPERLIQUID_INFO_SCHEMA,
+    HYPERLIQUID_TRADE_SCHEMA,
+)
+
 # File tools have no external requirements - they use the terminal backend
 def check_file_requirements():
     """File tools only require terminal backend to be available."""
@@ -260,5 +268,10 @@ __all__ = [
     'delegate_task',
     'check_delegate_requirements',
     'DELEGATE_TASK_SCHEMA',
+    # Hyperliquid trading tools
+    'hyperliquid_info',
+    'hyperliquid_trade',
+    'check_hyperliquid_requirements',
+    'HYPERLIQUID_INFO_SCHEMA',
+    'HYPERLIQUID_TRADE_SCHEMA',
 ]
-

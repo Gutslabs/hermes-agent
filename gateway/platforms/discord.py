@@ -7,6 +7,8 @@ Uses discord.py library for:
 - Handling threads and channels
 """
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
