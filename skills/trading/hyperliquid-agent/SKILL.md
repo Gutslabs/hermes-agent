@@ -77,6 +77,9 @@ SAFETY
 5. Live execution requires `dry_run=false` + `confirm_execution="EXECUTE_LIVE_TRADE"`. When user says YES, set these internally. Never ask the user to type the token.
 6. If guardrails fail, explain why and propose a safe alternative. Do not force execution.
 7. All coins listed on Hyperliquid are tradeable by default. No need to configure an allowlist unless the user explicitly wants to restrict trading to specific coins.
+8. CLOID is optional. If used, it must be valid (`0x` + 32 hex chars). Use `oid` by default unless cloid-based tracking/cancel is explicitly needed.
+9. Never use `execute_code` / Python wrappers for Hyperliquid actions. Always call `hyperliquid_info` / `hyperliquid_trade` directly.
+10. For `grouping=normalTpsl`, TP and SL sizes must match entry size (entry-linked bracket). Do not enlarge TP/SL to "full position" unless user explicitly requests position-level behavior.
 
 ## Intent mapping
 

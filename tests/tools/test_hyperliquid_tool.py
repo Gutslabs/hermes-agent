@@ -815,6 +815,88 @@ class TestHyperliquidTrade:
         assert est["sl_pnl_usd"] == -20.0  # (2000-2200)*0.1
         assert est["risk_reward_ratio"] == 1.0
 
+    def test_bulk_orders_normal_tpsl_reorders_main_and_enforces_reduce_only(self, monkeypatch):
+        monkeypatch.setattr(hlt, "_get_info_client", lambda base_url: DummyInfo())
+        monkeypatch.setenv("HYPERLIQUID_NETWORK", "testnet")
+        monkeypatch.setenv("HYPERLIQUID_MAX_NOTIONAL_USD", "100000")
+
+        # First order is mistakenly a trigger; tool should move main order first.
+        orders = [
+            {"coin": "ETH", "is_buy": False, "size": 0.02, "price": 2100.0, "tpsl": "tp", "trigger_px": 2100.0},
+            {"coin": "ETH", "is_buy": True, "size": 0.02, "price": 1900.0, "tif": "Gtc"},
+            {"coin": "ETH", "is_buy": False, "size": 0.02, "price": 1800.0, "tpsl": "sl", "trigger_px": 1800.0},
+        ]
+        result = json.loads(hlt.hyperliquid_trade(
+            action="bulk_orders", order_requests=orders, grouping="normalTpsl", dry_run=True,
+        ))
+        assert result["success"] is True
+        out = result["data"]["would_execute"]["order_requests"]
+        assert out[0].get("tpsl") is None
+        assert out[0]["is_buy"] is True
+        assert out[1]["tpsl"] == "tp"
+        assert out[1]["reduce_only"] is True
+        assert out[2]["tpsl"] == "sl"
+        assert out[2]["reduce_only"] is True
+
+    def test_bulk_orders_normal_tpsl_autofills_trigger_size_and_price(self, monkeypatch):
+        monkeypatch.setattr(hlt, "_get_info_client", lambda base_url: DummyInfo())
+        monkeypatch.setenv("HYPERLIQUID_NETWORK", "testnet")
+        monkeypatch.setenv("HYPERLIQUID_MAX_NOTIONAL_USD", "100000")
+
+        # TP/SL legs omit size/price; tool should infer from entry/trigger.
+        orders = [
+            {"coin": "ETH", "is_buy": True, "size": 0.01042, "price": 1920.0, "tif": "Gtc"},
+            {"coin": "ETH", "is_buy": False, "tpsl": "tp", "trigger_px": 2050.0},
+            {"coin": "ETH", "is_buy": False, "tpsl": "sl", "trigger_px": 1900.0},
+        ]
+        result = json.loads(hlt.hyperliquid_trade(
+            action="bulk_orders", order_requests=orders, grouping="normalTpsl", dry_run=True,
+        ))
+        assert result["success"] is True
+        out = result["data"]["would_execute"]["order_requests"]
+        assert out[1]["size"] == 0.01042
+        assert out[1]["price"] == 2050.0
+        assert out[1]["reduce_only"] is True
+        assert out[2]["size"] == 0.01042
+        assert out[2]["price"] == 1900.0
+        assert out[2]["reduce_only"] is True
+
+    def test_bulk_orders_normal_tpsl_clamps_trigger_sizes_to_entry_size(self, monkeypatch):
+        monkeypatch.setattr(hlt, "_get_info_client", lambda base_url: DummyInfo())
+        monkeypatch.setenv("HYPERLIQUID_NETWORK", "testnet")
+        monkeypatch.setenv("HYPERLIQUID_MAX_NOTIONAL_USD", "100000")
+
+        # Trigger legs are incorrectly oversized; tool should clamp them to entry size.
+        orders = [
+            {"coin": "ETH", "is_buy": True, "size": 0.0104, "price": 1920.0, "tif": "Gtc"},
+            {"coin": "ETH", "is_buy": False, "size": 0.0208, "price": 2050.0, "tpsl": "tp", "trigger_px": 2050.0},
+            {"coin": "ETH", "is_buy": False, "size": 0.0208, "price": 1900.0, "tpsl": "sl", "trigger_px": 1900.0},
+        ]
+        result = json.loads(hlt.hyperliquid_trade(
+            action="bulk_orders", order_requests=orders, grouping="normalTpsl", dry_run=True,
+        ))
+        assert result["success"] is True
+        out = result["data"]["would_execute"]["order_requests"]
+        assert out[0]["size"] == 0.0104
+        assert out[1]["size"] == 0.0104
+        assert out[2]["size"] == 0.0104
+
+    def test_bulk_orders_normal_tpsl_requires_non_trigger_main(self, monkeypatch):
+        monkeypatch.setattr(hlt, "_get_info_client", lambda base_url: DummyInfo())
+        monkeypatch.setenv("HYPERLIQUID_NETWORK", "testnet")
+        monkeypatch.setenv("HYPERLIQUID_MAX_NOTIONAL_USD", "100000")
+
+        orders = [
+            {"coin": "ETH", "is_buy": False, "size": 0.02, "price": 2100.0, "tpsl": "tp", "trigger_px": 2100.0},
+            {"coin": "ETH", "is_buy": False, "size": 0.02, "price": 1800.0, "tpsl": "sl", "trigger_px": 1800.0},
+        ]
+        result = json.loads(hlt.hyperliquid_trade(
+            action="bulk_orders", order_requests=orders, grouping="normalTpsl", dry_run=True,
+        ))
+        assert result["success"] is False
+        assert result["guardrail"]["error_code"] == "invalid_order_request"
+        assert "requires one non-trigger main order" in result["error"]
+
     def test_bulk_orders_no_tpsl_estimate_for_na_grouping(self, monkeypatch):
         """No PnL estimate for grouping='na'."""
         monkeypatch.setattr(hlt, "_get_info_client", lambda base_url: DummyInfo())
@@ -942,6 +1024,46 @@ class TestHyperliquidTrade:
         assert result["success"] is True
         assert result["mode"] == "live"
         assert exchange.calls[0][0] == "bulk_orders"
+
+    def test_bulk_orders_live_accepts_valid_cloid_fields(self, monkeypatch):
+        exchange = DummyExchange()
+        monkeypatch.setattr(hlt, "_get_info_client", lambda base_url: DummyInfo())
+        monkeypatch.setattr(hlt, "_create_exchange", lambda base_url: exchange)
+        monkeypatch.setenv("HYPERLIQUID_NETWORK", "testnet")
+        monkeypatch.setenv("HYPERLIQUID_KILL_SWITCH", "false")
+        monkeypatch.setenv("HYPERLIQUID_MAX_NOTIONAL_USD", "100000")
+
+        orders = [
+            {
+                "coin": "ETH",
+                "is_buy": True,
+                "size": 0.02,
+                "price": 1900.0,
+                "tif": "Gtc",
+                "cloid": "0x00000000000000000000000000000011",
+            },
+            {
+                "coin": "ETH",
+                "is_buy": False,
+                "size": 0.02,
+                "price": 2100.0,
+                "tpsl": "tp",
+                "trigger_px": 2100.0,
+                "reduce_only": True,
+                "cloid": "0x00000000000000000000000000000012",
+            },
+        ]
+        result = json.loads(hlt.hyperliquid_trade(
+            action="bulk_orders",
+            order_requests=orders,
+            grouping="normalTpsl",
+            dry_run=False,
+            confirm_execution="EXECUTE_LIVE_TRADE",
+        ))
+        assert result["success"] is True
+        assert exchange.calls[0][0] == "bulk_orders"
+        sent_orders = exchange.calls[0][1][0]
+        assert all("cloid" in o for o in sent_orders)
 
     # -- cancel_by_cloid tests ---------------------------------------------
 

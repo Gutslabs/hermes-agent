@@ -382,6 +382,66 @@ def _compute_tpsl_pnl(
     return result
 
 
+def _normalize_tpsl_grouping_orders(
+    order_requests: List[Dict[str, Any]], grouping: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Best-effort normalization for grouped TP/SL batches.
+
+    Hyperliquid expects the main/entry order to be a regular order (not trigger)
+    and TP/SL legs to be reduce-only. This function enforces that shape without
+    changing user-level semantics.
+    """
+    if grouping not in {"normalTpsl", "positionTpsl"} or not order_requests:
+        return order_requests
+
+    normalized: List[Dict[str, Any]] = [dict(req) for req in order_requests]
+    trigger_flags = [req.get("tpsl") in {"tp", "sl"} for req in normalized]
+
+    # Ensure the first order is a non-trigger main order whenever possible.
+    if trigger_flags[0]:
+        entry_index = next((i for i, is_trigger in enumerate(trigger_flags) if not is_trigger), None)
+        if entry_index is not None:
+            entry = normalized.pop(entry_index)
+            normalized.insert(0, entry)
+            trigger_flags = [req.get("tpsl") in {"tp", "sl"} for req in normalized]
+
+    entry_size: Optional[float] = None
+    if normalized and normalized[0].get("tpsl") not in {"tp", "sl"}:
+        entry_size = _validate_positive_number(normalized[0].get("size"))
+
+    # TP/SL legs must be reduce-only, and commonly inherit size/price details.
+    for i, req in enumerate(normalized):
+        if not trigger_flags[i]:
+            continue
+        req["reduce_only"] = True
+
+        req_size = _validate_positive_number(req.get("size"))
+
+        # For normalTpsl, TP/SL legs are entry-linked. Keep their size equal to entry.
+        # This avoids accidental over-closing (e.g. SL > entry size due to model drift).
+        if grouping == "normalTpsl" and entry_size is not None:
+            req["size"] = entry_size
+            req_size = entry_size
+        elif req_size is None and entry_size is not None:
+            # For other groupings, still provide sensible fallback when missing.
+            req["size"] = entry_size
+            req_size = entry_size
+
+        trigger_px = _validate_positive_number(req.get("trigger_px"))
+        req_price = _validate_positive_number(req.get("price"))
+
+        # If price is omitted on trigger legs, use trigger price.
+        if req_price is None and trigger_px is not None:
+            req["price"] = trigger_px
+            req_price = trigger_px
+
+        # If trigger price is omitted but a valid price exists, mirror it.
+        if trigger_px is None and req_price is not None:
+            req["trigger_px"] = req_price
+
+    return normalized
+
+
 def _build_order_type(req: Dict[str, Any]) -> dict:
     """Convert a flat order request dict into SDK order_type structure."""
     tpsl = req.get("tpsl")
@@ -886,6 +946,18 @@ def hyperliquid_trade(
                 code="invalid_grouping",
                 message=f"grouping must be one of {sorted(VALID_GROUPINGS)}",
             )
+        if grouping in {"normalTpsl", "positionTpsl"}:
+            has_main_order = any(req.get("tpsl") not in {"tp", "sl"} for req in order_requests)
+            if not has_main_order:
+                return _guardrail_error(
+                    network=network, mode=mode, action_or_query=action,
+                    code="invalid_order_request",
+                    message=(
+                        f"grouping '{grouping}' requires one non-trigger main order "
+                        "plus TP/SL trigger legs"
+                    ),
+                )
+            order_requests = _normalize_tpsl_grouping_orders(order_requests, grouping)
         for i, req in enumerate(order_requests):
             req_coin = str(req.get("coin", "")).strip()
             if not req_coin:
@@ -1625,13 +1697,19 @@ HYPERLIQUID_TRADE_SCHEMA = {
             "price": {"type": "number", "description": "Limit price or trigger price."},
             "tif": {"type": "string", "enum": ["Gtc", "Ioc", "Alo"], "description": "Time-in-force."},
             "oid": {"type": "integer", "description": "Order id for cancel/modify."},
-            "cloid": {"type": "string", "description": "Client order id (16-byte hex) for order/modify/cancel_by_cloid."},
+            "cloid": {
+                "type": "string",
+                "description": (
+                    "Client order id (0x + 32 lowercase hex). "
+                    "Use for order/modify/cancel_by_cloid."
+                ),
+            },
             "order_requests": {
                 "type": "array",
                 "description": (
                     "For bulk_orders: array of orders. First order is parent for TP/SL grouping. "
                     "For bulk_modify: array of modify requests (each with oid + order params). "
-                    "Each item: {coin, is_buy, size, price, tif?, reduce_only?, tpsl?, trigger_px?, is_market_trigger?, cloid?}"
+                    "Each item: {coin, is_buy, size, price, tif?, reduce_only?, tpsl?, trigger_px?, is_market_trigger?, cloid?, oid?}"
                 ),
                 "items": {
                     "type": "object",
