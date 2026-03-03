@@ -649,6 +649,31 @@ class TestHyperliquidTrade:
         assert exchange.calls[0][0] == "market_open"
         assert exchange.calls[0][1][2] == 0.01
 
+    def test_market_open_notional_usd_normalizes_size_to_coin_precision(self, monkeypatch):
+        class PrecisionInfo(DummyInfo):
+            def __init__(self):
+                super().__init__()
+                self.coin_to_asset = {"ETH": 0}
+                self.asset_to_sz_decimals = {0: 4}
+
+            def all_mids(self):
+                return {"ETH": "2027"}
+
+        monkeypatch.setattr(hlt, "_get_info_client", lambda base_url: PrecisionInfo())
+        monkeypatch.setenv("HYPERLIQUID_NETWORK", "testnet")
+        monkeypatch.setenv("HYPERLIQUID_MAX_NOTIONAL_USD", "1000")
+
+        result = json.loads(hlt.hyperliquid_trade(
+            action="market_open",
+            coin="ETH",
+            is_buy=True,
+            notional_usd=30.0,
+            dry_run=True,
+        ))
+        assert result["success"] is True
+        assert result["data"]["would_execute"]["size"] == 0.0148
+        assert result["data"]["preflight"]["effective_size"] == 0.0148
+
     def test_market_open_rejects_conflicting_size_and_notional(self, monkeypatch):
         monkeypatch.setattr(hlt, "_get_info_client", lambda base_url: DummyInfo())
         monkeypatch.setenv("HYPERLIQUID_NETWORK", "testnet")

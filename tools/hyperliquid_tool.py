@@ -9,6 +9,7 @@ This module registers two tools:
 
 import json
 import os
+from decimal import ROUND_DOWN, Decimal
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from tools.registry import registry
@@ -175,6 +176,36 @@ def _validate_positive_number(value: Any) -> Optional[float]:
     if parsed is None or parsed <= 0:
         return None
     return parsed
+
+
+def _coin_size_decimals(info_client, coin: str) -> int:
+    """Best-effort size precision lookup; fallback to SDK wire precision (8)."""
+    try:
+        canonical = getattr(info_client, "name_to_coin", {}).get(coin, coin)
+        coin_to_asset = getattr(info_client, "coin_to_asset", {})
+        asset_to_sz = getattr(info_client, "asset_to_sz_decimals", {})
+        asset = coin_to_asset.get(canonical)
+        if asset is None and hasattr(info_client, "name_to_asset"):
+            asset = info_client.name_to_asset(canonical)
+        decimals = asset_to_sz.get(asset)
+        if isinstance(decimals, int) and decimals >= 0:
+            return min(decimals, 8)
+    except Exception:
+        pass
+    return 8
+
+
+def _normalize_size_for_coin(info_client, coin: str, size: float) -> Optional[float]:
+    """Normalize size so SDK wire conversion and exchange precision checks pass."""
+    parsed = _validate_positive_number(size)
+    if parsed is None:
+        return None
+    decimals = _coin_size_decimals(info_client, coin)
+    quant = Decimal("1e-{0}".format(decimals))
+    normalized = Decimal(str(parsed)).quantize(quant, rounding=ROUND_DOWN)
+    if normalized <= 0:
+        return None
+    return float(normalized)
 
 
 def _estimate_mid_price(info_client, coin: str) -> Optional[float]:
@@ -1167,6 +1198,15 @@ def hyperliquid_trade(
                     code="invalid_size_or_notional",
                     message="Derived size from notional_usd is invalid",
                 )
+        if action == "market_open" and effective_size is not None:
+            normalized_size = _normalize_size_for_coin(info_client, str(coin or ""), effective_size)
+            if normalized_size is None:
+                return _guardrail_error(
+                    network=network, mode=mode, action_or_query=action,
+                    code="invalid_size_or_notional",
+                    message="size is too small after precision normalization for this coin",
+                )
+            effective_size = normalized_size
 
         # -- Preflight notional check --------------------------------------
         estimated_notional, preflight_err, details = _build_preflight(
