@@ -22,6 +22,9 @@ firecrawl-py
 # Image generation
 fal-client
 
+# Trading
+hyperliquid-python-sdk
+
 # mini-swe-agent dependencies (for terminal tool)
 # Note: Install mini-swe-agent itself with: pip install -e ./mini-swe-agent
 litellm>=1.75.5

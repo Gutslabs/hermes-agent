@@ -3018,12 +3018,17 @@ def main(
                 else:
                     toolsets_list.append(str(t))
     else:
-        # Check config for CLI toolsets, fallback to hermes-cli
-        config_cli_toolsets = CLI_CONFIG.get("platform_toolsets", {}).get("cli")
-        if config_cli_toolsets and isinstance(config_cli_toolsets, list):
-            toolsets_list = config_cli_toolsets
+        # Prefer root-level toolsets from config.yaml (new config system).
+        # Fallback to legacy platform_toolsets.cli, then hermes-cli.
+        config_root_toolsets = CLI_CONFIG.get("toolsets")
+        if isinstance(config_root_toolsets, list) and config_root_toolsets:
+            toolsets_list = [str(t).strip() for t in config_root_toolsets if str(t).strip()]
         else:
-            toolsets_list = ["hermes-cli"]
+            config_cli_toolsets = CLI_CONFIG.get("platform_toolsets", {}).get("cli")
+            if isinstance(config_cli_toolsets, list) and config_cli_toolsets:
+                toolsets_list = [str(t).strip() for t in config_cli_toolsets if str(t).strip()]
+            else:
+                toolsets_list = ["hermes-cli"]
     
     # Create CLI instance
     cli = HermesCLI(

@@ -185,3 +185,63 @@ def test_cmd_model_falls_back_to_auto_on_invalid_provider(monkeypatch, capsys):
     assert "Warning:" in output
     assert "falling back to auto provider detection" in output.lower()
     assert "No change." in output
+
+
+def test_main_uses_root_toolsets_from_config(monkeypatch):
+    cli = _import_cli()
+    monkeypatch.setitem(cli.CLI_CONFIG, "toolsets", ["hermes-cli", "trading"])
+
+    captured = {}
+
+    class _DummyCLI:
+        def __init__(self, **kwargs):
+            captured["toolsets"] = kwargs.get("toolsets")
+            self.console = SimpleNamespace(print=lambda *args, **kwargs: None)
+
+        def show_banner(self):
+            return None
+
+        def chat(self, _query):
+            return None
+
+        def _print_exit_summary(self):
+            return None
+
+        def run(self):
+            raise AssertionError("run() should not be called in query mode")
+
+    monkeypatch.setattr(cli, "HermesCLI", _DummyCLI)
+    monkeypatch.setattr(cli.atexit, "register", lambda *args, **kwargs: None)
+
+    cli.main(query="ping")
+
+    assert captured["toolsets"] == ["hermes-cli", "trading"]
+
+
+def test_main_falls_back_to_legacy_platform_toolsets(monkeypatch):
+    cli = _import_cli()
+    monkeypatch.setitem(cli.CLI_CONFIG, "toolsets", None)
+    monkeypatch.setitem(cli.CLI_CONFIG, "platform_toolsets", {"cli": ["hermes-cli", "memory"]})
+
+    captured = {}
+
+    class _DummyCLI:
+        def __init__(self, **kwargs):
+            captured["toolsets"] = kwargs.get("toolsets")
+            self.console = SimpleNamespace(print=lambda *args, **kwargs: None)
+
+        def show_banner(self):
+            return None
+
+        def chat(self, _query):
+            return None
+
+        def _print_exit_summary(self):
+            return None
+
+    monkeypatch.setattr(cli, "HermesCLI", _DummyCLI)
+    monkeypatch.setattr(cli.atexit, "register", lambda *args, **kwargs: None)
+
+    cli.main(query="ping")
+
+    assert captured["toolsets"] == ["hermes-cli", "memory"]

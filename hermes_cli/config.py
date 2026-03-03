@@ -236,6 +236,76 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "HYPERLIQUID_ACCOUNT_ADDRESS": {
+        "description": "Hyperliquid main account address (not API wallet address)",
+        "prompt": "Hyperliquid account address",
+        "url": "https://app.hyperliquid.xyz/API",
+        "tools": ["hyperliquid_info", "hyperliquid_trade"],
+        "password": False,
+        "category": "tool",
+    },
+    "HYPERLIQUID_SECRET_KEY": {
+        "description": "Hyperliquid API wallet private key for signed trading actions",
+        "prompt": "Hyperliquid API wallet private key",
+        "url": "https://app.hyperliquid.xyz/API",
+        "tools": ["hyperliquid_trade"],
+        "password": True,
+        "category": "tool",
+    },
+    "HYPERLIQUID_NETWORK": {
+        "description": "Hyperliquid network selection: testnet or mainnet (default: testnet)",
+        "prompt": "Hyperliquid network (testnet/mainnet)",
+        "url": "https://hyperliquid.gitbook.io/hyperliquid-docs",
+        "tools": ["hyperliquid_info", "hyperliquid_trade"],
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
+    "HYPERLIQUID_VAULT_ADDRESS": {
+        "description": "Optional Hyperliquid vault/subaccount address",
+        "prompt": "Hyperliquid vault address (optional)",
+        "url": "https://hyperliquid.gitbook.io/hyperliquid-docs",
+        "tools": ["hyperliquid_trade"],
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
+    "HYPERLIQUID_ALLOWED_COINS": {
+        "description": "Optional CSV allowlist for tradable symbols (e.g. BTC,ETH,PURR/USDC)",
+        "prompt": "Allowed coins CSV (optional)",
+        "url": "https://hyperliquid.gitbook.io/hyperliquid-docs",
+        "tools": ["hyperliquid_trade"],
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
+    "HYPERLIQUID_MAX_NOTIONAL_USD": {
+        "description": "Max per-action notional cap in USD for guardrails (default: 1000)",
+        "prompt": "Max notional USD",
+        "url": "https://hyperliquid.gitbook.io/hyperliquid-docs",
+        "tools": ["hyperliquid_trade"],
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
+    "HYPERLIQUID_KILL_SWITCH": {
+        "description": "Blocks all live trading actions when true (default: true)",
+        "prompt": "Enable kill switch (true/false)",
+        "url": "https://hyperliquid.gitbook.io/hyperliquid-docs",
+        "tools": ["hyperliquid_trade"],
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
+    "HYPERLIQUID_MAINNET_ALLOW_DRY_RUN": {
+        "description": "Allow dry-run previews on mainnet (default: false)",
+        "prompt": "Allow dry-run on mainnet (true/false)",
+        "url": "https://hyperliquid.gitbook.io/hyperliquid-docs",
+        "tools": ["hyperliquid_trade"],
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
 
     # ── Honcho ──
     "HONCHO_API_KEY": {
@@ -813,8 +883,8 @@ def edit_config():
 
 def set_config_value(key: str, value: str):
     """Set a configuration value."""
-    # Check if it's an API key (goes to .env)
-    api_keys = [
+    # Check if this is an environment-backed setting (goes to .env)
+    legacy_env_keys = [
         'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
         'FIRECRAWL_API_KEY', 'BROWSERBASE_API_KEY', 'BROWSERBASE_PROJECT_ID',
         'FAL_KEY', 'TELEGRAM_BOT_TOKEN', 'DISCORD_BOT_TOKEN',
@@ -822,8 +892,12 @@ def set_config_value(key: str, value: str):
         'SUDO_PASSWORD', 'SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN',
         'GITHUB_TOKEN', 'HONCHO_API_KEY',
     ]
-    
-    if key.upper() in api_keys or key.upper().startswith('TERMINAL_SSH'):
+
+    env_keys = set(legacy_env_keys)
+    env_keys.update(REQUIRED_ENV_VARS.keys())
+    env_keys.update(OPTIONAL_ENV_VARS.keys())
+
+    if key.upper() in env_keys or key.upper().startswith('TERMINAL_SSH'):
         save_env_value(key.upper(), value)
         print(f"✓ Set {key} in {get_env_path()}")
         return

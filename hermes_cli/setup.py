@@ -261,6 +261,96 @@ def _prompt_api_key(var: dict):
         print_warning(f"  Skipped (configure later with 'hermes setup')")
 
 
+def _configure_hyperliquid_settings():
+    """Prompt and save Hyperliquid trading settings as a single bundled flow."""
+    print()
+    print(color("  ─── Hyperliquid Trading ───", Colors.CYAN))
+    print_info("  Uses strict guardrails: live confirm token,")
+    print_info("  symbol allowlist, max notional cap, and kill switch.")
+    print_info("  Mainnet default: no dry-run previews (YES/NO confirm flow).")
+    print_info("  Hyperliquid docs: https://hyperliquid.gitbook.io/hyperliquid-docs")
+
+    existing_address = get_env_value("HYPERLIQUID_ACCOUNT_ADDRESS") or ""
+    existing_secret = get_env_value("HYPERLIQUID_SECRET_KEY") or ""
+    existing_network = (get_env_value("HYPERLIQUID_NETWORK") or "testnet").lower()
+    existing_vault = get_env_value("HYPERLIQUID_VAULT_ADDRESS") or ""
+    existing_allowlist = get_env_value("HYPERLIQUID_ALLOWED_COINS") or ""
+    existing_max_notional = get_env_value("HYPERLIQUID_MAX_NOTIONAL_USD") or "1000"
+    existing_kill_switch = (get_env_value("HYPERLIQUID_KILL_SWITCH") or "true").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+    existing_mainnet_allow_dry_run = (
+        (get_env_value("HYPERLIQUID_MAINNET_ALLOW_DRY_RUN") or "false").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+    address = prompt("    Account address (0x...)", default=existing_address)
+    if address:
+        save_env_value("HYPERLIQUID_ACCOUNT_ADDRESS", address)
+        print_success("    Account address saved")
+
+    if existing_secret:
+        print_success("  API wallet key is already configured ✓")
+        if prompt_yes_no("  Update API wallet private key?", False):
+            secret = prompt("    API wallet private key", password=True)
+            if secret:
+                if not secret.startswith("0x"):
+                    secret = "0x" + secret
+                    print_info("    Auto-added 0x prefix to private key")
+                save_env_value("HYPERLIQUID_SECRET_KEY", secret)
+                print_success("    API wallet key updated")
+    else:
+        print_info("    Note: Most Web3 wallets export keys without the 0x prefix — it will be added automatically.")
+        secret = prompt("    API wallet private key", password=True)
+        if secret:
+            if not secret.startswith("0x"):
+                secret = "0x" + secret
+                print_info("    Auto-added 0x prefix to private key")
+            save_env_value("HYPERLIQUID_SECRET_KEY", secret)
+            print_success("    API wallet key saved")
+        else:
+            print_warning("    No key provided (live trade actions will remain blocked)")
+
+    network_default_idx = 1 if existing_network == "mainnet" else 0
+    network_idx = prompt_choice(
+        "  Select Hyperliquid network:",
+        ["testnet (default, safer)", "mainnet (live funds)"],
+        network_default_idx,
+    )
+    network = "mainnet" if network_idx == 1 else "testnet"
+    save_env_value("HYPERLIQUID_NETWORK", network)
+    print_success(f"    Network set to {network}")
+
+    vault = prompt("    Vault/Subaccount address (optional)", default=existing_vault)
+    save_env_value("HYPERLIQUID_VAULT_ADDRESS", vault or "")
+
+    allowlist = prompt(
+        "    Allowed coins CSV (leave empty = all coins tradeable, e.g. BTC,ETH)",
+        default=existing_allowlist,
+    )
+    save_env_value("HYPERLIQUID_ALLOWED_COINS", allowlist or "")
+
+    max_notional = prompt("    Max notional USD per action", default=existing_max_notional)
+    save_env_value("HYPERLIQUID_MAX_NOTIONAL_USD", max_notional or "1000")
+
+    kill_switch = prompt_yes_no("  Enable kill switch (recommended)?", existing_kill_switch)
+    save_env_value("HYPERLIQUID_KILL_SWITCH", "true" if kill_switch else "false")
+    if kill_switch:
+        print_warning("    Kill switch is ON (live actions blocked until disabled)")
+    else:
+        print_warning("    Kill switch is OFF (live actions possible with explicit confirm token)")
+
+    allow_mainnet_dry_run = prompt_yes_no(
+        "  Allow dry-run previews on mainnet?",
+        existing_mainnet_allow_dry_run,
+    )
+    save_env_value("HYPERLIQUID_MAINNET_ALLOW_DRY_RUN", "true" if allow_mainnet_dry_run else "false")
+    if allow_mainnet_dry_run:
+        print_warning("    Mainnet dry-run previews enabled")
+    else:
+        print_success("    Mainnet dry-run previews disabled (YES/NO -> live flow)")
+
+
 def _print_setup_summary(config: dict, hermes_home):
     """Print the setup completion summary."""
     # Tool availability summary
@@ -313,6 +403,12 @@ def _print_setup_summary(config: dict, hermes_home):
         tool_status.append(("Skills Hub (GitHub)", True, None))
     else:
         tool_status.append(("Skills Hub (GitHub)", False, "GITHUB_TOKEN"))
+
+    # Hyperliquid Trading
+    if get_env_value('HYPERLIQUID_SECRET_KEY'):
+        tool_status.append(("Hyperliquid Trading (guarded)", True, None))
+    else:
+        tool_status.append(("Hyperliquid Trading (guarded)", False, "HYPERLIQUID_SECRET_KEY"))
     
     # Terminal (always available if system deps met)
     tool_status.append(("Terminal/Commands", True, None))
@@ -517,11 +613,23 @@ def run_setup_wizard(args):
             print()
             print_header("Tool API Keys")
 
+            checklist_items = []  # list of ("var", var_dict) or ("hyperliquid_bundle", None)
             checklist_labels = []
+
+            has_missing_hyperliquid = any(v["name"].startswith("HYPERLIQUID_") for v in missing_tools)
             for var in missing_tools:
+                if var["name"].startswith("HYPERLIQUID_"):
+                    continue
                 tools = var.get("tools", [])
                 tools_str = f" → {', '.join(tools[:2])}" if tools else ""
+                checklist_items.append(("var", var))
                 checklist_labels.append(f"{var.get('description', var['name'])}{tools_str}")
+
+            if has_missing_hyperliquid:
+                checklist_items.append(("hyperliquid_bundle", None))
+                checklist_labels.append(
+                    "Hyperliquid trading setup (account, API wallet key, network, guardrails)"
+                )
 
             selected_indices = prompt_checklist(
                 "Which tools would you like to configure?",
@@ -529,8 +637,11 @@ def run_setup_wizard(args):
             )
 
             for idx in selected_indices:
-                var = missing_tools[idx]
-                _prompt_api_key(var)
+                item_type, payload = checklist_items[idx]
+                if item_type == "var":
+                    _prompt_api_key(payload)
+                elif item_type == "hyperliquid_bundle":
+                    _configure_hyperliquid_settings()
 
         # ── Messaging platforms (checklist then prompt for selected) ──
         if missing_messaging:
@@ -1478,6 +1589,11 @@ def run_setup_wizard(args):
             "key": "github",
             "check": ["GITHUB_TOKEN"],
         },
+        {
+            "label": "📈 Hyperliquid Trading (Perps + Spot, strict guardrails)",
+            "key": "hyperliquid",
+            "check": ["HYPERLIQUID_SECRET_KEY"],
+        },
     ]
     
     # Pre-select tools that are already configured
@@ -1701,6 +1817,9 @@ def run_setup_wizard(args):
             if token:
                 save_env_value("GITHUB_TOKEN", token)
                 print_success("    Configured ✓")
+
+    if "hyperliquid" in selected_keys:
+        _configure_hyperliquid_settings()
 
     # =========================================================================
     # Save config and show summary
