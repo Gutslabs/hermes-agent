@@ -62,15 +62,15 @@ class TestScanCronPrompt:
 
 
 class TestCronjobRequirements:
-    def test_requires_crontab_binary_even_in_interactive_mode(self, monkeypatch):
+    def test_is_enabled_without_crontab_binary(self, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
         monkeypatch.setattr("shutil.which", lambda name: None)
 
-        assert check_cronjob_requirements() is False
+        assert check_cronjob_requirements() is True
 
-    def test_accepts_interactive_mode_when_crontab_exists(self, monkeypatch):
+    def test_is_enabled_when_crontab_exists(self, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)

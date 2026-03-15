@@ -78,6 +78,7 @@ def _prompt_yes_no(question: str, default: bool = True) -> bool:
 CONFIGURABLE_TOOLSETS = [
     ("web",             "🔍 Web Search & Scraping",    "web_search, web_extract"),
     ("browser",         "🌐 Browser Automation",       "navigate, click, type, scroll"),
+    ("trading",         "📈 Hyperliquid Trading",      "hyperliquid_info, hyperliquid_trade"),
     ("terminal",        "💻 Terminal & Processes",      "terminal, process"),
     ("file",            "📁 File Operations",           "read, write, patch, search"),
     ("code_execution",  "⚡ Code Execution",            "execute_code"),
@@ -99,7 +100,7 @@ CONFIGURABLE_TOOLSETS = [
 # Toolsets that are OFF by default for new installs.
 # They're still in _HERMES_CORE_TOOLS (available at runtime if enabled),
 # but the setup checklist won't pre-select them for first-time users.
-_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl"}
+_DEFAULT_OFF_TOOLSETS = {"moa", "homeassistant", "rl", "trading"}
 
 # Platform display config
 PLATFORMS = {
@@ -200,6 +201,70 @@ TOOL_CATEGORIES = {
                     {"key": "BROWSERBASE_PROJECT_ID", "prompt": "Browserbase project ID"},
                 ],
                 "post_setup": "browserbase",
+            },
+        ],
+    },
+    "trading": {
+        "name": "Hyperliquid Trading",
+        "icon": "📈",
+        "providers": [
+            {
+                "name": "Hyperliquid",
+                "tag": "Perps + spot with strict guardrails",
+                "required_env_keys": [
+                    "HYPERLIQUID_ACCOUNT_ADDRESS",
+                    "HYPERLIQUID_SECRET_KEY",
+                ],
+                "env_vars": [
+                    {
+                        "key": "HYPERLIQUID_ACCOUNT_ADDRESS",
+                        "prompt": "Hyperliquid account address",
+                        "url": "https://app.hyperliquid.xyz/API",
+                        "password": False,
+                    },
+                    {
+                        "key": "HYPERLIQUID_SECRET_KEY",
+                        "prompt": "Hyperliquid API wallet private key",
+                        "url": "https://app.hyperliquid.xyz/API",
+                        "password": True,
+                    },
+                    {
+                        "key": "HYPERLIQUID_NETWORK",
+                        "prompt": "Network (testnet/mainnet)",
+                        "default": "testnet",
+                        "password": False,
+                    },
+                    {
+                        "key": "HYPERLIQUID_VAULT_ADDRESS",
+                        "prompt": "Vault/subaccount address (optional)",
+                        "default": "",
+                        "password": False,
+                    },
+                    {
+                        "key": "HYPERLIQUID_ALLOWED_COINS",
+                        "prompt": "Allowed coins CSV (optional)",
+                        "default": "",
+                        "password": False,
+                    },
+                    {
+                        "key": "HYPERLIQUID_MAX_NOTIONAL_USD",
+                        "prompt": "Max notional USD",
+                        "default": "1000",
+                        "password": False,
+                    },
+                    {
+                        "key": "HYPERLIQUID_KILL_SWITCH",
+                        "prompt": "Enable kill switch (true/false)",
+                        "default": "true",
+                        "password": False,
+                    },
+                    {
+                        "key": "HYPERLIQUID_MAINNET_ALLOW_DRY_RUN",
+                        "prompt": "Allow mainnet dry-run previews (true/false)",
+                        "default": "false",
+                        "password": False,
+                    },
+                ],
             },
         ],
     },
@@ -375,6 +440,11 @@ def _toolset_has_keys(ts_key: str) -> bool:
     cat = TOOL_CATEGORIES.get(ts_key)
     if cat:
         for provider in cat.get("providers", []):
+            required_keys = provider.get("required_env_keys")
+            if required_keys:
+                if all(get_env_value(key) for key in required_keys):
+                    return True
+                continue
             env_vars = provider.get("env_vars", [])
             if env_vars and all(get_env_value(e["key"]) for e in env_vars):
                 return True
@@ -553,8 +623,14 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict):
         for p in providers:
             tag = f" ({p['tag']})" if p.get("tag") else ""
             configured = ""
+            required_keys = p.get("required_env_keys", [])
             env_vars = p.get("env_vars", [])
-            if not env_vars or all(get_env_value(v["key"]) for v in env_vars):
+            provider_ready = (
+                all(get_env_value(key) for key in required_keys)
+                if required_keys
+                else (not env_vars or all(get_env_value(v["key"]) for v in env_vars))
+            )
+            if provider_ready:
                 if p.get("tts_provider") and config.get("tts", {}).get("provider") == p["tts_provider"]:
                     configured = " [active]"
                 elif not env_vars:
@@ -572,8 +648,14 @@ def _configure_tool_category(ts_key: str, cat: dict, config: dict):
             if p.get("tts_provider") and config.get("tts", {}).get("provider") == p["tts_provider"]:
                 default_idx = i
                 break
+            required_keys = p.get("required_env_keys", [])
             env_vars = p.get("env_vars", [])
-            if env_vars and all(get_env_value(v["key"]) for v in env_vars):
+            provider_ready = (
+                all(get_env_value(key) for key in required_keys)
+                if required_keys
+                else (env_vars and all(get_env_value(v["key"]) for v in env_vars))
+            )
+            if provider_ready:
                 default_idx = i
                 break
 
@@ -613,10 +695,18 @@ def _configure_provider(provider: dict, config: dict):
                 _print_info(f"  Get yours at: {url}")
 
             default_val = var.get("default", "")
+            password = bool(var.get("password", not default_val))
             if default_val:
-                value = _prompt(f"    {var.get('prompt', var['key'])}", default_val)
+                value = _prompt(
+                    f"    {var.get('prompt', var['key'])}",
+                    default_val,
+                    password=password,
+                )
             else:
-                value = _prompt(f"    {var.get('prompt', var['key'])}", password=True)
+                value = _prompt(
+                    f"    {var.get('prompt', var['key'])}",
+                    password=password,
+                )
 
             if value:
                 save_env_value(var["key"], value)
@@ -745,8 +835,14 @@ def _configure_tool_category_for_reconfig(ts_key: str, cat: dict, config: dict):
         for p in providers:
             tag = f" ({p['tag']})" if p.get("tag") else ""
             configured = ""
+            required_keys = p.get("required_env_keys", [])
             env_vars = p.get("env_vars", [])
-            if not env_vars or all(get_env_value(v["key"]) for v in env_vars):
+            provider_ready = (
+                all(get_env_value(key) for key in required_keys)
+                if required_keys
+                else (not env_vars or all(get_env_value(v["key"]) for v in env_vars))
+            )
+            if provider_ready:
                 if p.get("tts_provider") and config.get("tts", {}).get("provider") == p["tts_provider"]:
                     configured = " [active]"
                 elif not env_vars:
@@ -760,8 +856,14 @@ def _configure_tool_category_for_reconfig(ts_key: str, cat: dict, config: dict):
             if p.get("tts_provider") and config.get("tts", {}).get("provider") == p["tts_provider"]:
                 default_idx = i
                 break
+            required_keys = p.get("required_env_keys", [])
             env_vars = p.get("env_vars", [])
-            if env_vars and all(get_env_value(v["key"]) for v in env_vars):
+            provider_ready = (
+                all(get_env_value(key) for key in required_keys)
+                if required_keys
+                else (env_vars and all(get_env_value(v["key"]) for v in env_vars))
+            )
+            if provider_ready:
                 default_idx = i
                 break
 
@@ -789,7 +891,11 @@ def _reconfigure_provider(provider: dict, config: dict):
         if url:
             _print_info(f"  Get yours at: {url}")
         default_val = var.get("default", "")
-        value = _prompt(f"    {var.get('prompt', var['key'])} (Enter to keep current)", password=not default_val)
+        password = bool(var.get("password", not default_val))
+        value = _prompt(
+            f"    {var.get('prompt', var['key'])} (Enter to keep current)",
+            password=password,
+        )
         if value and value.strip():
             save_env_value(var["key"], value.strip())
             _print_success(f"    Updated")

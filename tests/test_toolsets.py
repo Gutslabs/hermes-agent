@@ -24,6 +24,11 @@ class TestGetToolset:
     def test_unknown_returns_none(self):
         assert get_toolset("nonexistent") is None
 
+    def test_trading_toolset_shape(self):
+        ts = get_toolset("trading")
+        assert ts is not None
+        assert set(ts["tools"]) == {"hyperliquid_info", "hyperliquid_trade"}
+
 
 class TestResolveToolset:
     def test_leaf_toolset(self):

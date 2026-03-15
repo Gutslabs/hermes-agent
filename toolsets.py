@@ -153,6 +153,12 @@ TOOLSETS = {
         "tools": ["text_to_speech"],
         "includes": []
     },
+
+    "trading": {
+        "description": "Hyperliquid market/account data and guarded trading actions",
+        "tools": ["hyperliquid_info", "hyperliquid_trade"],
+        "includes": []
+    },
     
     "todo": {
         "description": "Task planning and tracking for multi-step work",
