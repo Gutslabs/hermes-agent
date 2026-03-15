@@ -4312,10 +4312,10 @@ class GatewayRunner:
         return response
 
 
-def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int = 60):
+def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int = 10):
     """
     Background thread that ticks the cron scheduler at a regular interval.
-    
+
     Runs inside the gateway process so cronjobs fire automatically without
     needing a separate `hermes cron daemon` or system cron entry.
 
@@ -4325,8 +4325,8 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, interval: int
     from cron.scheduler import tick as cron_tick
     from gateway.platforms.base import cleanup_image_cache, cleanup_document_cache
 
-    IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
-    CHANNEL_DIR_EVERY = 5    # ticks — every 5 minutes
+    IMAGE_CACHE_EVERY = 360  # ticks — once per hour at 10s interval (360*10=3600s)
+    CHANNEL_DIR_EVERY = 30   # ticks — every 5 minutes at 10s interval (30*10=300s)
 
     logger.info("Cron ticker started (interval=%ds)", interval)
     tick_count = 0

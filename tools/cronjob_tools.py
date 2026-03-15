@@ -413,18 +413,10 @@ def check_cronjob_requirements() -> bool:
     """
     Check if cronjob tools can be used.
 
-    Requires 'crontab' executable to be present in the system PATH.
-    Available in interactive CLI mode and gateway/messaging platforms.
+    Always enabled — Hermes uses its own file-based cron scheduler,
+    not the system crontab.
     """
-    # Ensure the system can actually install and manage cron entries.
-    if not shutil.which("crontab"):
-        return False
-
-    return bool(
-        os.getenv("HERMES_INTERACTIVE")
-        or os.getenv("HERMES_GATEWAY_SESSION")
-        or os.getenv("HERMES_EXEC_ASK")
-    )
+    return True
 
 
 def get_cronjob_tool_definitions():
