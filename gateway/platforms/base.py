@@ -24,7 +24,14 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
+from hermes_cli.config import get_hermes_home
+
+
+GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
+    "Secure secret entry is not supported over messaging. "
+    "Load this skill in the local CLI to be prompted, or add the key to ~/.hermes/.env manually."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,8 +43,8 @@ from gateway.session import SessionSource
 # (e.g. Telegram file URLs expire after ~1 hour).
 # ---------------------------------------------------------------------------
 
-# Default location: ~/.hermes/image_cache/
-IMAGE_CACHE_DIR = Path(os.path.expanduser("~/.hermes/image_cache"))
+# Default location: {HERMES_HOME}/image_cache/
+IMAGE_CACHE_DIR = get_hermes_home() / "image_cache"
 
 
 def get_image_cache_dir() -> Path:
@@ -119,7 +126,7 @@ def cleanup_image_cache(max_age_hours: int = 24) -> int:
 # here so the STT tool (OpenAI Whisper) can transcribe them from local files.
 # ---------------------------------------------------------------------------
 
-AUDIO_CACHE_DIR = Path(os.path.expanduser("~/.hermes/audio_cache"))
+AUDIO_CACHE_DIR = get_hermes_home() / "audio_cache"
 
 
 def get_audio_cache_dir() -> Path:
@@ -178,7 +185,7 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg") -> str:
 # here so the agent can reference them by local file path.
 # ---------------------------------------------------------------------------
 
-DOCUMENT_CACHE_DIR = Path(os.path.expanduser("~/.hermes/document_cache"))
+DOCUMENT_CACHE_DIR = get_hermes_home() / "document_cache"
 
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
@@ -252,6 +259,7 @@ def cleanup_document_cache(max_age_hours: int = 24) -> int:
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"
+    LOCATION = "location"
     PHOTO = "photo"
     VIDEO = "video"
     AUDIO = "audio"
@@ -338,11 +346,81 @@ class BasePlatformAdapter(ABC):
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
         self._running = False
+        self._fatal_error_code: Optional[str] = None
+        self._fatal_error_message: Optional[str] = None
+        self._fatal_error_retryable = True
+        self._fatal_error_handler: Optional[Callable[["BasePlatformAdapter"], Awaitable[None] | None]] = None
         
         # Track active message handlers per session for interrupt support
         # Key: session_key (e.g., chat_id), Value: (event, asyncio.Event for interrupt)
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
+        # Chats where auto-TTS on voice input is disabled (set by /voice off)
+        self._auto_tts_disabled_chats: set = set()
+
+    @property
+    def has_fatal_error(self) -> bool:
+        return self._fatal_error_message is not None
+
+    @property
+    def fatal_error_message(self) -> Optional[str]:
+        return self._fatal_error_message
+
+    @property
+    def fatal_error_code(self) -> Optional[str]:
+        return self._fatal_error_code
+
+    @property
+    def fatal_error_retryable(self) -> bool:
+        return self._fatal_error_retryable
+
+    def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
+        self._fatal_error_handler = handler
+
+    def _mark_connected(self) -> None:
+        self._running = True
+        self._fatal_error_code = None
+        self._fatal_error_message = None
+        self._fatal_error_retryable = True
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(platform=self.platform.value, platform_state="connected", error_code=None, error_message=None)
+        except Exception:
+            pass
+
+    def _mark_disconnected(self) -> None:
+        self._running = False
+        if self.has_fatal_error:
+            return
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(platform=self.platform.value, platform_state="disconnected", error_code=None, error_message=None)
+        except Exception:
+            pass
+
+    def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
+        self._running = False
+        self._fatal_error_code = code
+        self._fatal_error_message = message
+        self._fatal_error_retryable = retryable
+        try:
+            from gateway.status import write_runtime_status
+            write_runtime_status(
+                platform=self.platform.value,
+                platform_state="fatal",
+                error_code=code,
+                error_message=message,
+            )
+        except Exception:
+            pass
+
+    async def _notify_fatal_error(self) -> None:
+        handler = self._fatal_error_handler
+        if not handler:
+            return
+        result = handler(self)
+        if asyncio.iscoroutine(result):
+            await result
     
     @property
     def name(self) -> str:
@@ -398,12 +476,26 @@ class BasePlatformAdapter(ABC):
             SendResult with success status and message ID
         """
         pass
-    
-    async def send_typing(self, chat_id: str) -> None:
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+    ) -> SendResult:
+        """
+        Edit a previously sent message. Optional — platforms that don't
+        support editing return success=False and callers fall back to
+        sending a new message.
+        """
+        return SendResult(success=False, error="Not supported")
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
         
         Override in subclasses if the platform supports it.
+        metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
         """
         pass
     
@@ -482,10 +574,14 @@ class BasePlatformAdapter(ABC):
             url = match.group(1)
             images.append((url, ""))
         
-        # Remove matched image tags from content if we found images
+        # Remove only the matched image tags from content (not all markdown images)
         if images:
-            cleaned = re.sub(md_pattern, '', cleaned)
-            cleaned = re.sub(html_pattern, '', cleaned)
+            extracted_urls = {url for url, _ in images}
+            def _remove_if_extracted(match):
+                url = match.group(2) if match.lastindex >= 2 else match.group(1)
+                return '' if url in extracted_urls else match.group(0)
+            cleaned = re.sub(md_pattern, _remove_if_extracted, cleaned)
+            cleaned = re.sub(html_pattern, _remove_if_extracted, cleaned)
             # Clean up leftover blank lines
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
@@ -497,6 +593,7 @@ class BasePlatformAdapter(ABC):
         audio_path: str,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        **kwargs,
     ) -> SendResult:
         """
         Send an audio file as a native voice message via the platform API.
@@ -509,7 +606,80 @@ class BasePlatformAdapter(ABC):
         if caption:
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
-    
+
+    async def play_tts(
+        self,
+        chat_id: str,
+        audio_path: str,
+        **kwargs,
+    ) -> SendResult:
+        """
+        Play auto-TTS audio for voice replies.
+
+        Override in subclasses for invisible playback (e.g. Web UI).
+        Default falls back to send_voice (shows audio player).
+        """
+        return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """
+        Send a video natively via the platform API.
+
+        Override in subclasses to send videos as inline playable media.
+        Default falls back to sending the file path as text.
+        """
+        text = f"🎬 Video: {video_path}"
+        if caption:
+            text = f"{caption}\n{text}"
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """
+        Send a document/file natively via the platform API.
+
+        Override in subclasses to send files as downloadable attachments.
+        Default falls back to sending the file path as text.
+        """
+        text = f"📎 File: {file_path}"
+        if caption:
+            text = f"{caption}\n{text}"
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs,
+    ) -> SendResult:
+        """
+        Send a local image file natively via the platform API.
+
+        Unlike send_image() which takes a URL, this takes a local file path.
+        Override in subclasses for native photo attachments.
+        Default falls back to sending the file path as text.
+        """
+        text = f"🖼️ Image: {image_path}"
+        if caption:
+            text = f"{caption}\n{text}"
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to)
+
     @staticmethod
     def extract_media(content: str) -> Tuple[List[Tuple[str, bool]], str]:
         """
@@ -532,21 +702,27 @@ class BasePlatformAdapter(ABC):
         has_voice_tag = "[[audio_as_voice]]" in content
         cleaned = cleaned.replace("[[audio_as_voice]]", "")
         
-        # Extract MEDIA:<path> tags (path may contain spaces)
-        media_pattern = r'MEDIA:(\S+)'
-        for match in re.finditer(media_pattern, content):
-            path = match.group(1).strip()
+        # Extract MEDIA:<path> tags, allowing optional whitespace after the colon
+        # and quoted/backticked paths for LLM-formatted outputs.
+        media_pattern = re.compile(
+            r'''[`"']?MEDIA:\s*(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?'''
+        )
+        for match in media_pattern.finditer(content):
+            path = match.group("path").strip()
+            if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
+                path = path[1:-1].strip()
+            path = path.lstrip("`\"'").rstrip("`\"',.;:)}]")
             if path:
                 media.append((path, has_voice_tag))
-        
-        # Remove MEDIA tags from content
+
+        # Remove MEDIA tags from content (including surrounding quote/backtick wrappers)
         if media:
-            cleaned = re.sub(media_pattern, '', cleaned)
+            cleaned = media_pattern.sub('', cleaned)
             cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
         
         return media, cleaned
     
-    async def _keep_typing(self, chat_id: str, interval: float = 2.0) -> None:
+    async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
         """
         Continuously send typing indicator until cancelled.
         
@@ -555,7 +731,7 @@ class BasePlatformAdapter(ABC):
         """
         try:
             while True:
-                await self.send_typing(chat_id)
+                await self.send_typing(chat_id, metadata=metadata)
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
@@ -571,7 +747,7 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
         
-        session_key = event.source.chat_id
+        session_key = build_session_key(event.source)
         
         # Check if there's already an active handler for this session
         if session_key in self._active_sessions:
@@ -613,7 +789,8 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id))
+        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
         
         try:
             # Call the handler (this can take a while with tool calls)
@@ -628,16 +805,55 @@ class BasePlatformAdapter(ABC):
                 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
+                if images:
+                    logger.info("[%s] extract_images found %d image(s) in response (%d chars)", self.name, len(images), len(response))
                 
-                # Send the text portion first (if any remains after extractions)
+                # Auto-TTS: if voice message, generate audio FIRST (before sending text)
+                # Skipped when the chat has voice mode disabled (/voice off)
+                _tts_path = None
+                if (event.message_type == MessageType.VOICE
+                        and text_content
+                        and not media_files
+                        and event.source.chat_id not in self._auto_tts_disabled_chats):
+                    try:
+                        from tools.tts_tool import text_to_speech_tool, check_tts_requirements
+                        if check_tts_requirements():
+                            import json as _json
+                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+                            if not speech_text:
+                                raise ValueError("Empty text after markdown cleanup")
+                            tts_result_str = await asyncio.to_thread(
+                                text_to_speech_tool, text=speech_text
+                            )
+                            tts_data = _json.loads(tts_result_str)
+                            _tts_path = tts_data.get("file_path")
+                    except Exception as tts_err:
+                        logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
+
+                # Play TTS audio before text (voice-first experience)
+                if _tts_path and Path(_tts_path).exists():
+                    try:
+                        await self.play_tts(
+                            chat_id=event.source.chat_id,
+                            audio_path=_tts_path,
+                            metadata=_thread_metadata,
+                        )
+                    finally:
+                        try:
+                            os.remove(_tts_path)
+                        except OSError:
+                            pass
+
+                # Send the text portion
                 if text_content:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     result = await self.send(
                         chat_id=event.source.chat_id,
                         content=text_content,
-                        reply_to=event.message_id
+                        reply_to=event.message_id,
+                        metadata=_thread_metadata,
                     )
-                    
+
                     # Log send failures (don't raise - user already saw tool progress)
                     if not result.success:
                         print(f"[{self.name}] Failed to send response: {result.error}")
@@ -645,50 +861,82 @@ class BasePlatformAdapter(ABC):
                         fallback_result = await self.send(
                             chat_id=event.source.chat_id,
                             content=f"(Response formatting failed, plain text:)\n\n{text_content[:3500]}",
-                            reply_to=event.message_id
+                            reply_to=event.message_id,
+                            metadata=_thread_metadata,
                         )
                         if not fallback_result.success:
                             print(f"[{self.name}] Fallback send also failed: {fallback_result.error}")
-                
+
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()
-                
+
                 # Send extracted images as native attachments
+                if images:
+                    logger.info("[%s] Extracted %d image(s) to send as attachments", self.name, len(images))
                 for image_url, alt_text in images:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
+                        logger.info("[%s] Sending image: %s (alt=%s)", self.name, image_url[:80], alt_text[:30] if alt_text else "")
                         # Route animated GIFs through send_animation for proper playback
                         if self._is_animation_url(image_url):
                             img_result = await self.send_animation(
                                 chat_id=event.source.chat_id,
                                 animation_url=image_url,
                                 caption=alt_text if alt_text else None,
+                                metadata=_thread_metadata,
                             )
                         else:
                             img_result = await self.send_image(
                                 chat_id=event.source.chat_id,
                                 image_url=image_url,
                                 caption=alt_text if alt_text else None,
+                                metadata=_thread_metadata,
                             )
                         if not img_result.success:
-                            print(f"[{self.name}] Failed to send image: {img_result.error}")
+                            logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                     except Exception as img_err:
-                        print(f"[{self.name}] Error sending image: {img_err}")
-                
-                # Send extracted audio/voice files as native attachments
-                for audio_path, is_voice in media_files:
+                        logger.error("[%s] Error sending image: %s", self.name, img_err, exc_info=True)
+
+                # Send extracted media files — route by file type
+                _AUDIO_EXTS = {'.ogg', '.opus', '.mp3', '.wav', '.m4a'}
+                _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.3gp'}
+                _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
+
+                for media_path, is_voice in media_files:
                     if human_delay > 0:
                         await asyncio.sleep(human_delay)
                     try:
-                        voice_result = await self.send_voice(
-                            chat_id=event.source.chat_id,
-                            audio_path=audio_path,
-                        )
-                        if not voice_result.success:
-                            print(f"[{self.name}] Failed to send voice: {voice_result.error}")
-                    except Exception as voice_err:
-                        print(f"[{self.name}] Error sending voice: {voice_err}")
+                        ext = Path(media_path).suffix.lower()
+                        if ext in _AUDIO_EXTS:
+                            media_result = await self.send_voice(
+                                chat_id=event.source.chat_id,
+                                audio_path=media_path,
+                                metadata=_thread_metadata,
+                            )
+                        elif ext in _VIDEO_EXTS:
+                            media_result = await self.send_video(
+                                chat_id=event.source.chat_id,
+                                video_path=media_path,
+                                metadata=_thread_metadata,
+                            )
+                        elif ext in _IMAGE_EXTS:
+                            media_result = await self.send_image_file(
+                                chat_id=event.source.chat_id,
+                                image_path=media_path,
+                                metadata=_thread_metadata,
+                            )
+                        else:
+                            media_result = await self.send_document(
+                                chat_id=event.source.chat_id,
+                                file_path=media_path,
+                                metadata=_thread_metadata,
+                            )
+
+                        if not media_result.success:
+                            print(f"[{self.name}] Failed to send media ({ext}): {media_result.error}")
+                    except Exception as media_err:
+                        print(f"[{self.name}] Error sending media: {media_err}")
             
             # Check if there's a pending message that was queued during our processing
             if session_key in self._pending_messages:
@@ -738,6 +986,8 @@ class BasePlatformAdapter(ABC):
         user_name: Optional[str] = None,
         thread_id: Optional[str] = None,
         chat_topic: Optional[str] = None,
+        user_id_alt: Optional[str] = None,
+        chat_id_alt: Optional[str] = None,
     ) -> SessionSource:
         """Helper to build a SessionSource for this platform."""
         # Normalize empty topic to None
@@ -752,6 +1002,8 @@ class BasePlatformAdapter(ABC):
             user_name=user_name,
             thread_id=str(thread_id) if thread_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
+            user_id_alt=user_id_alt,
+            chat_id_alt=chat_id_alt,
         )
     
     @abstractmethod
@@ -833,11 +1085,11 @@ class BasePlatformAdapter(ABC):
 
             full_chunk = prefix + chunk_body
 
-            # Walk the chunk line-by-line to determine whether we end
-            # inside an open code block.
+            # Walk only the chunk_body (not the prefix we prepended) to
+            # determine whether we end inside an open code block.
             in_code = carry_lang is not None
             lang = carry_lang or ""
-            for line in full_chunk.split("\n"):
+            for line in chunk_body.split("\n"):
                 stripped = line.strip()
                 if stripped.startswith("```"):
                     if in_code:

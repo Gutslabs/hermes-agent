@@ -95,6 +95,47 @@ class TestBuildApiKwargsOpenRouter:
         assert "instructions" not in kwargs
         assert "store" not in kwargs
 
+    def test_strips_codex_only_tool_call_fields_from_chat_messages(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "Checking now.",
+                "codex_reasoning_items": [
+                    {"type": "reasoning", "id": "rs_1", "encrypted_content": "blob"},
+                ],
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "call_id": "call_123",
+                        "response_item_id": "fc_123",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{\"command\":\"pwd\"}"},
+                        "extra_content": {"thought_signature": "opaque"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_123", "content": "/tmp"},
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assistant_msg = kwargs["messages"][1]
+        tool_call = assistant_msg["tool_calls"][0]
+
+        assert "codex_reasoning_items" not in assistant_msg
+        assert tool_call["id"] == "call_123"
+        assert tool_call["function"]["name"] == "terminal"
+        assert tool_call["extra_content"] == {"thought_signature": "opaque"}
+        assert "call_id" not in tool_call
+        assert "response_item_id" not in tool_call
+
+        # Original stored history must remain unchanged for Responses replay mode.
+        assert messages[1]["tool_calls"][0]["call_id"] == "call_123"
+        assert messages[1]["tool_calls"][0]["response_item_id"] == "fc_123"
+        assert "codex_reasoning_items" in messages[1]
+
 
 class TestBuildApiKwargsNousPortal:
     def test_includes_nous_product_tags(self, monkeypatch):
@@ -127,6 +168,52 @@ class TestBuildApiKwargsCustomEndpoint:
         extra = kwargs.get("extra_body", {})
         assert "reasoning" not in extra
 
+    def test_fireworks_tool_call_payload_strips_codex_only_fields(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "custom",
+            base_url="https://api.fireworks.ai/inference/v1",
+        )
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "Checking now.",
+                "codex_reasoning_items": [
+                    {"type": "reasoning", "id": "rs_1", "encrypted_content": "blob"},
+                ],
+                "tool_calls": [
+                    {
+                        "id": "call_fw_123",
+                        "call_id": "call_fw_123",
+                        "response_item_id": "fc_fw_123",
+                        "type": "function",
+                        "function": {
+                            "name": "terminal",
+                            "arguments": "{\"command\":\"pwd\"}",
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_fw_123", "content": "/tmp"},
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert kwargs["tools"][0]["function"]["name"] == "web_search"
+        assert "input" not in kwargs
+        assert kwargs.get("extra_body", {}) == {}
+
+        assistant_msg = kwargs["messages"][1]
+        tool_call = assistant_msg["tool_calls"][0]
+
+        assert "codex_reasoning_items" not in assistant_msg
+        assert tool_call["id"] == "call_fw_123"
+        assert tool_call["type"] == "function"
+        assert tool_call["function"]["name"] == "terminal"
+        assert "call_id" not in tool_call
+        assert "response_item_id" not in tool_call
+
 
 class TestBuildApiKwargsCodex:
     def test_uses_responses_api_format(self, monkeypatch):
@@ -145,7 +232,7 @@ class TestBuildApiKwargsCodex:
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)
         assert "reasoning" in kwargs
-        assert kwargs["reasoning"]["effort"] == "xhigh"
+        assert kwargs["reasoning"]["effort"] == "medium"
 
     def test_includes_encrypted_content_in_include(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
@@ -456,7 +543,7 @@ class TestAuxiliaryClientProviderPriority:
              patch("agent.auxiliary_client._read_codex_access_token", return_value="codex-tok"), \
              patch("agent.auxiliary_client.OpenAI"):
             client, model = get_text_auxiliary_client()
-        assert model == "gpt-5.3-codex"
+        assert model == "gpt-5.2-codex"
         assert isinstance(client, CodexAuxiliaryClient)
 
 
@@ -596,19 +683,19 @@ class TestCodexReasoningPreflight:
 # ── Reasoning effort consistency tests ───────────────────────────────────────
 
 class TestReasoningEffortDefaults:
-    """Verify reasoning effort defaults to xhigh across all provider paths."""
+    """Verify reasoning effort defaults to medium across all provider paths."""
 
-    def test_openrouter_default_xhigh(self, monkeypatch):
+    def test_openrouter_default_medium(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openrouter")
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         reasoning = kwargs["extra_body"]["reasoning"]
-        assert reasoning["effort"] == "xhigh"
+        assert reasoning["effort"] == "medium"
 
-    def test_codex_default_xhigh(self, monkeypatch):
+    def test_codex_default_medium(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
-        assert kwargs["reasoning"]["effort"] == "xhigh"
+        assert kwargs["reasoning"]["effort"] == "medium"
 
     def test_codex_reasoning_disabled(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",

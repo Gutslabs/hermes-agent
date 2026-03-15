@@ -13,7 +13,7 @@ handler are thin wrappers that parse args and delegate.
 import json
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -57,8 +57,9 @@ def _resolve_short_name(name: str, sources, console: Console) -> str:
         table.add_column("Trust", style="dim")
         table.add_column("Identifier", style="bold cyan")
         for r in exact:
-            trust_style = {"trusted": "green", "community": "yellow"}.get(r.trust_level, "dim")
-            table.add_row(r.source, f"[{trust_style}]{r.trust_level}[/]", r.identifier)
+            trust_style = {"builtin": "bright_cyan", "trusted": "green", "community": "yellow"}.get(r.trust_level, "dim")
+            trust_label = "official" if r.source == "official" else r.trust_level
+            table.add_row(r.source, f"[{trust_style}]{trust_label}[/]", r.identifier)
         c.print(table)
         c.print("[bold]Use the full identifier to install a specific one.[/]\n")
         return ""
@@ -73,6 +74,70 @@ def _resolve_short_name(name: str, sources, console: Console) -> str:
 
     c.print(f"[bold red]Error:[/] No skill named '{name}' found in any source.\n")
     return ""
+
+
+def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    if not extra:
+        return lines
+
+    if extra.get("repo_url"):
+        lines.append(f"[bold]Repo:[/] {extra['repo_url']}")
+    if extra.get("detail_url"):
+        lines.append(f"[bold]Detail Page:[/] {extra['detail_url']}")
+    if extra.get("index_url"):
+        lines.append(f"[bold]Index:[/] {extra['index_url']}")
+    if extra.get("endpoint"):
+        lines.append(f"[bold]Endpoint:[/] {extra['endpoint']}")
+    if extra.get("install_command"):
+        lines.append(f"[bold]Install Command:[/] {extra['install_command']}")
+    if extra.get("installs") is not None:
+        lines.append(f"[bold]Installs:[/] {extra['installs']}")
+    if extra.get("weekly_installs"):
+        lines.append(f"[bold]Weekly Installs:[/] {extra['weekly_installs']}")
+
+    security = extra.get("security_audits")
+    if isinstance(security, dict) and security:
+        ordered = ", ".join(f"{name}={status}" for name, status in sorted(security.items()))
+        lines.append(f"[bold]Security:[/] {ordered}")
+
+    return lines
+
+
+def _resolve_source_meta_and_bundle(identifier: str, sources):
+    """Resolve metadata and bundle for a specific identifier."""
+    meta = None
+    bundle = None
+    matched_source = None
+
+    for src in sources:
+        if meta is None:
+            try:
+                meta = src.inspect(identifier)
+                if meta:
+                    matched_source = src
+            except Exception:
+                meta = None
+        try:
+            bundle = src.fetch(identifier)
+        except Exception:
+            bundle = None
+        if bundle:
+            matched_source = src
+            if meta is None:
+                try:
+                    meta = src.inspect(identifier)
+                except Exception:
+                    meta = None
+            break
+
+    return meta, bundle, matched_source
+
+
+def _derive_category_from_install_path(install_path: str) -> str:
+    path = Path(install_path)
+    parent = str(path.parent)
+    return "" if parent == "." else parent
 
 
 def do_search(query: str, source: str = "all", limit: int = 10,
@@ -99,16 +164,141 @@ def do_search(query: str, source: str = "all", limit: int = 10,
     table.add_column("Identifier", style="dim")
 
     for r in results:
-        trust_style = {"trusted": "green", "community": "yellow"}.get(r.trust_level, "dim")
+        trust_style = {"builtin": "bright_cyan", "trusted": "green", "community": "yellow"}.get(r.trust_level, "dim")
+        trust_label = "official" if r.source == "official" else r.trust_level
         table.add_row(
             r.name,
             r.description[:60] + ("..." if len(r.description) > 60 else ""),
             r.source,
-            f"[{trust_style}]{r.trust_level}[/]",
+            f"[{trust_style}]{trust_label}[/]",
             r.identifier,
         )
 
     c.print(table)
+    c.print("[dim]Use: hermes skills inspect <identifier> to preview, "
+            "hermes skills install <identifier> to install[/]\n")
+
+
+def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
+              console: Optional[Console] = None) -> None:
+    """Browse all available skills across registries, paginated.
+
+    Official skills are always shown first, regardless of source filter.
+    """
+    from tools.skills_hub import (
+        GitHubAuth, create_source_router, OptionalSkillSource, SkillMeta,
+    )
+
+    # Clamp page_size to safe range
+    page_size = max(1, min(page_size, 100))
+
+    c = console or _console
+
+    auth = GitHubAuth()
+    sources = create_source_router(auth)
+
+    # Collect results from all (or filtered) sources
+    # Use empty query to get everything; per-source limits prevent overload
+    _TRUST_RANK = {"builtin": 3, "trusted": 2, "community": 1}
+    _PER_SOURCE_LIMIT = {"official": 100, "skills-sh": 100, "well-known": 25, "github": 100, "clawhub": 50,
+                         "claude-marketplace": 50, "lobehub": 50}
+
+    all_results: list = []
+    source_counts: dict = {}
+
+    for src in sources:
+        sid = src.source_id()
+        if source != "all" and sid != source and sid != "official":
+            # Always include official source for the "first" placement
+            continue
+        try:
+            limit = _PER_SOURCE_LIMIT.get(sid, 50)
+            results = src.search("", limit=limit)
+            source_counts[sid] = len(results)
+            all_results.extend(results)
+        except Exception:
+            continue
+
+    if not all_results:
+        c.print("[dim]No skills found in the Skills Hub.[/]\n")
+        return
+
+    # Deduplicate by name, preferring higher trust
+    seen: dict = {}
+    for r in all_results:
+        rank = _TRUST_RANK.get(r.trust_level, 0)
+        if r.name not in seen or rank > _TRUST_RANK.get(seen[r.name].trust_level, 0):
+            seen[r.name] = r
+    deduped = list(seen.values())
+
+    # Sort: official first, then by trust level (desc), then alphabetically
+    deduped.sort(key=lambda r: (
+        -_TRUST_RANK.get(r.trust_level, 0),
+        r.source != "official",
+        r.name.lower(),
+    ))
+
+    # Paginate
+    total = len(deduped)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(1, min(page, total_pages))
+    start = (page - 1) * page_size
+    end = min(start + page_size, total)
+    page_items = deduped[start:end]
+
+    # Count official vs other
+    official_count = sum(1 for r in deduped if r.source == "official")
+
+    # Build header
+    source_label = f"— {source}" if source != "all" else "— all sources"
+    c.print(f"\n[bold]Skills Hub — Browse {source_label}[/]"
+            f"  [dim]({total} skills, page {page}/{total_pages})[/]")
+    if official_count > 0 and page == 1:
+        c.print(f"[bright_cyan]★ {official_count} official optional skill(s) from Nous Research[/]")
+    c.print()
+
+    # Build table
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Name", style="bold cyan", max_width=25)
+    table.add_column("Description", max_width=50)
+    table.add_column("Source", style="dim", width=12)
+    table.add_column("Trust", width=10)
+
+    for i, r in enumerate(page_items, start=start + 1):
+        trust_style = {"builtin": "bright_cyan", "trusted": "green",
+                       "community": "yellow"}.get(r.trust_level, "dim")
+        trust_label = "★ official" if r.source == "official" else r.trust_level
+
+        desc = r.description[:50]
+        if len(r.description) > 50:
+            desc += "..."
+
+        table.add_row(
+            str(i),
+            r.name,
+            desc,
+            r.source,
+            f"[{trust_style}]{trust_label}[/]",
+        )
+
+    c.print(table)
+
+    # Navigation hints
+    nav_parts = []
+    if page > 1:
+        nav_parts.append(f"[cyan]--page {page - 1}[/] ← prev")
+    if page < total_pages:
+        nav_parts.append(f"[cyan]--page {page + 1}[/] → next")
+
+    if nav_parts:
+        c.print(f"  {' | '.join(nav_parts)}")
+
+    # Source summary
+    if source == "all" and source_counts:
+        parts = [f"{sid}: {ct}" for sid, ct in sorted(source_counts.items())]
+        c.print(f"  [dim]Sources: {', '.join(parts)}[/]")
+
     c.print("[dim]Use: hermes skills inspect <identifier> to preview, "
             "hermes skills install <identifier> to install[/]\n")
 
@@ -137,15 +327,17 @@ def do_install(identifier: str, category: str = "", force: bool = False,
 
     c.print(f"\n[bold]Fetching:[/] {identifier}")
 
-    bundle = None
-    for src in sources:
-        bundle = src.fetch(identifier)
-        if bundle:
-            break
+    meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not bundle:
         c.print(f"[bold red]Error:[/] Could not fetch '{identifier}' from any source.\n")
         return
+
+    # Auto-detect category for official skills (e.g. "official/autonomous-ai-agents/blackbox")
+    if bundle.source == "official" and not category:
+        id_parts = bundle.identifier.split("/")  # ["official", "category", "skill"]
+        if len(id_parts) >= 3:
+            category = id_parts[1]
 
     # Check if already installed
     lock = HubLockFile()
@@ -155,6 +347,9 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         if not force:
             c.print("Use --force to reinstall.\n")
             return
+
+    extra_metadata = dict(getattr(meta, "extra", {}) or {})
+    extra_metadata.update(getattr(bundle, "metadata", {}) or {})
 
     # Quarantine the bundle
     q_path = quarantine_bundle(bundle)
@@ -177,18 +372,33 @@ def do_install(identifier: str, category: str = "", force: bool = False,
                          f"{len(result.findings)}_findings")
         return
 
-    # Confirm with user — always show risk warning regardless of source
+    if extra_metadata:
+        metadata_lines = _format_extra_metadata_lines(extra_metadata)
+        if metadata_lines:
+            c.print(Panel("\n".join(metadata_lines), title="Upstream Metadata", border_style="blue"))
+
+    # Confirm with user — show appropriate warning based on source
     if not force:
         c.print()
-        c.print(Panel(
-            "[bold yellow]You are installing a third-party skill at your own risk.[/]\n\n"
-            "External skills can contain instructions that influence agent behavior,\n"
-            "shell commands, and scripts. Even after automated scanning, you should\n"
-            "review the installed files before use.\n\n"
-            f"Files will be at: [cyan]~/.hermes/skills/{category + '/' if category else ''}{bundle.name}/[/]",
-            title="Disclaimer",
-            border_style="yellow",
-        ))
+        if bundle.source == "official":
+            c.print(Panel(
+                "[bold bright_cyan]This is an official optional skill maintained by Nous Research.[/]\n\n"
+                "It ships with hermes-agent but is not activated by default.\n"
+                "Installing will copy it to your skills directory where the agent can use it.\n\n"
+                f"Files will be at: [cyan]~/.hermes/skills/{category + '/' if category else ''}{bundle.name}/[/]",
+                title="Official Skill",
+                border_style="bright_cyan",
+            ))
+        else:
+            c.print(Panel(
+                "[bold yellow]You are installing a third-party skill at your own risk.[/]\n\n"
+                "External skills can contain instructions that influence agent behavior,\n"
+                "shell commands, and scripts. Even after automated scanning, you should\n"
+                "review the installed files before use.\n\n"
+                f"Files will be at: [cyan]~/.hermes/skills/{category + '/' if category else ''}{bundle.name}/[/]",
+                title="Disclaimer",
+                border_style="yellow",
+            ))
         c.print(f"[bold]Install '{bundle.name}'?[/]")
         try:
             answer = input("Confirm [y/N]: ").strip().lower()
@@ -219,35 +429,26 @@ def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
         if not identifier:
             return
 
-    meta = None
-    for src in sources:
-        meta = src.inspect(identifier)
-        if meta:
-            break
+    meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not meta:
         c.print(f"[bold red]Error:[/] Could not find '{identifier}' in any source.\n")
         return
 
-    # Also fetch full content for preview
-    bundle = None
-    for src in sources:
-        bundle = src.fetch(identifier)
-        if bundle:
-            break
-
     c.print()
-    trust_style = {"trusted": "green", "community": "yellow"}.get(meta.trust_level, "dim")
+    trust_style = {"builtin": "bright_cyan", "trusted": "green", "community": "yellow"}.get(meta.trust_level, "dim")
+    trust_label = "official" if meta.source == "official" else meta.trust_level
 
     info_lines = [
         f"[bold]Name:[/] {meta.name}",
         f"[bold]Description:[/] {meta.description}",
         f"[bold]Source:[/] {meta.source}",
-        f"[bold]Trust:[/] [{trust_style}]{meta.trust_level}[/]",
+        f"[bold]Trust:[/] [{trust_style}]{trust_label}[/]",
         f"[bold]Identifier:[/] {meta.identifier}",
     ]
     if meta.tags:
         info_lines.append(f"[bold]Tags:[/] {', '.join(meta.tags)}")
+    info_lines.extend(_format_extra_metadata_lines(meta.extra))
 
     c.print(Panel("\n".join(info_lines), title=f"Skill: {meta.name}"))
 
@@ -264,13 +465,16 @@ def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
 
 
 def do_list(source_filter: str = "all", console: Optional[Console] = None) -> None:
-    """List installed skills, distinguishing builtins from hub-installed."""
-    from tools.skills_hub import HubLockFile, SKILLS_DIR
+    """List installed skills, distinguishing hub, builtin, and local skills."""
+    from tools.skills_hub import HubLockFile, ensure_hub_dirs
+    from tools.skills_sync import _read_manifest
     from tools.skills_tool import _find_all_skills
 
     c = console or _console
+    ensure_hub_dirs()
     lock = HubLockFile()
     hub_installed = {e["name"]: e for e in lock.list_installed()}
+    builtin_names = set(_read_manifest())
 
     all_skills = _find_all_skills()
 
@@ -280,29 +484,85 @@ def do_list(source_filter: str = "all", console: Optional[Console] = None) -> No
     table.add_column("Source", style="dim")
     table.add_column("Trust", style="dim")
 
+    hub_count = 0
+    builtin_count = 0
+    local_count = 0
+
     for skill in sorted(all_skills, key=lambda s: (s.get("category") or "", s["name"])):
         name = skill["name"]
         category = skill.get("category", "")
         hub_entry = hub_installed.get(name)
 
         if hub_entry:
+            source_type = "hub"
             source_display = hub_entry.get("source", "hub")
             trust = hub_entry.get("trust_level", "community")
-        else:
+            hub_count += 1
+        elif name in builtin_names:
+            source_type = "builtin"
             source_display = "builtin"
             trust = "builtin"
+            builtin_count += 1
+        else:
+            source_type = "local"
+            source_display = "local"
+            trust = "local"
+            local_count += 1
 
-        if source_filter == "hub" and not hub_entry:
-            continue
-        if source_filter == "builtin" and hub_entry:
+        if source_filter != "all" and source_filter != source_type:
             continue
 
-        trust_style = {"builtin": "blue", "trusted": "green", "community": "yellow"}.get(trust, "dim")
-        table.add_row(name, category, source_display, f"[{trust_style}]{trust}[/]")
+        trust_style = {"builtin": "bright_cyan", "trusted": "green", "community": "yellow", "local": "dim"}.get(trust, "dim")
+        trust_label = "official" if source_display == "official" else trust
+        table.add_row(name, category, source_display, f"[{trust_style}]{trust_label}[/]")
 
     c.print(table)
-    c.print(f"[dim]{len(hub_installed)} hub-installed, "
-            f"{len(all_skills) - len(hub_installed)} builtin[/]\n")
+    c.print(
+        f"[dim]{hub_count} hub-installed, {builtin_count} builtin, {local_count} local[/]\n"
+    )
+
+
+def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> None:
+    """Check hub-installed skills for upstream updates."""
+    from tools.skills_hub import check_for_skill_updates
+
+    c = console or _console
+    results = check_for_skill_updates(name=name)
+    if not results:
+        c.print("[dim]No hub-installed skills to check.[/]\n")
+        return
+
+    table = Table(title="Skill Updates")
+    table.add_column("Name", style="bold cyan")
+    table.add_column("Source", style="dim")
+    table.add_column("Status", style="dim")
+
+    for entry in results:
+        table.add_row(entry.get("name", ""), entry.get("source", ""), entry.get("status", ""))
+
+    c.print(table)
+    update_count = sum(1 for entry in results if entry.get("status") == "update_available")
+    c.print(f"[dim]{update_count} update(s) available across {len(results)} checked skill(s)[/]\n")
+
+
+def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> None:
+    """Update hub-installed skills with upstream changes."""
+    from tools.skills_hub import HubLockFile, check_for_skill_updates
+
+    c = console or _console
+    lock = HubLockFile()
+    updates = [entry for entry in check_for_skill_updates(name=name) if entry.get("status") == "update_available"]
+    if not updates:
+        c.print("[dim]No updates available.[/]\n")
+        return
+
+    for entry in updates:
+        installed = lock.get_installed(entry["name"])
+        category = _derive_category_from_install_path(installed.get("install_path", "")) if installed else ""
+        c.print(f"[bold]Updating:[/] {entry['name']}")
+        do_install(entry["identifier"], category=category, force=True, console=c)
+
+    c.print(f"[bold green]Updated {len(updates)} skill(s).[/]\n")
 
 
 def do_audit(name: Optional[str] = None, console: Optional[Console] = None) -> None:
@@ -658,7 +918,9 @@ def skills_command(args) -> None:
     """Router for `hermes skills <subcommand>` — called from hermes_cli/main.py."""
     action = getattr(args, "skills_action", None)
 
-    if action == "search":
+    if action == "browse":
+        do_browse(page=args.page, page_size=args.size, source=args.source)
+    elif action == "search":
         do_search(args.query, source=args.source, limit=args.limit)
     elif action == "install":
         do_install(args.identifier, category=args.category, force=args.force)
@@ -666,6 +928,10 @@ def skills_command(args) -> None:
         do_inspect(args.identifier)
     elif action == "list":
         do_list(source_filter=args.source)
+    elif action == "check":
+        do_check(name=getattr(args, "name", None))
+    elif action == "update":
+        do_update(name=getattr(args, "name", None))
     elif action == "audit":
         do_audit(name=getattr(args, "name", None))
     elif action == "uninstall":
@@ -692,7 +958,7 @@ def skills_command(args) -> None:
             return
         do_tap(tap_action, repo=repo)
     else:
-        _console.print("Usage: hermes skills [search|install|inspect|list|audit|uninstall|publish|snapshot|tap]\n")
+        _console.print("Usage: hermes skills [browse|search|install|inspect|list|check|update|audit|uninstall|publish|snapshot|tap]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")
 
 
@@ -711,6 +977,8 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
         /skills inspect openai/skills/skill-creator
         /skills list
         /skills list --source hub
+        /skills check
+        /skills update
         /skills audit
         /skills audit my-skill
         /skills uninstall my-skill
@@ -732,9 +1000,34 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
     action = parts[0].lower()
     args = parts[1:]
 
-    if action == "search":
+    if action == "browse":
+        page = 1
+        page_size = 20
+        source = "all"
+        i = 0
+        while i < len(args):
+            if args[i] == "--page" and i + 1 < len(args):
+                try:
+                    page = int(args[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif args[i] == "--size" and i + 1 < len(args):
+                try:
+                    page_size = int(args[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            elif args[i] == "--source" and i + 1 < len(args):
+                source = args[i + 1]
+                i += 2
+            else:
+                i += 1
+        do_browse(page=page, page_size=page_size, source=source, console=c)
+
+    elif action == "search":
         if not args:
-            c.print("[bold red]Usage:[/] /skills search <query> [--source github] [--limit N]\n")
+            c.print("[bold red]Usage:[/] /skills search <query> [--source skills-sh|well-known|github|official] [--limit N]\n")
             return
         source = "all"
         limit = 10
@@ -757,11 +1050,11 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "install":
         if not args:
-            c.print("[bold red]Usage:[/] /skills install <identifier> [--category <cat>] [--force]\n")
+            c.print("[bold red]Usage:[/] /skills install <identifier> [--category <cat>] [--force|--yes]\n")
             return
         identifier = args[0]
         category = ""
-        force = "--force" in args
+        force = any(flag in args for flag in ("--force", "--yes", "-y"))
         for i, a in enumerate(args):
             if a == "--category" and i + 1 < len(args):
                 category = args[i + 1]
@@ -780,6 +1073,14 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
             if idx + 1 < len(args):
                 source_filter = args[idx + 1]
         do_list(source_filter=source_filter, console=c)
+
+    elif action == "check":
+        name = args[0] if args else None
+        do_check(name=name, console=c)
+
+    elif action == "update":
+        name = args[0] if args else None
+        do_update(name=name, console=c)
 
     elif action == "audit":
         name = args[0] if args else None
@@ -838,10 +1139,13 @@ def _print_skills_help(console: Console) -> None:
     """Print help for the /skills slash command."""
     console.print(Panel(
         "[bold]Skills Hub Commands:[/]\n\n"
+        "  [cyan]browse[/] [--source official]   Browse all available skills (paginated)\n"
         "  [cyan]search[/] <query>              Search registries for skills\n"
         "  [cyan]install[/] <identifier>        Install a skill (with security scan)\n"
         "  [cyan]inspect[/] <identifier>        Preview a skill without installing\n"
-        "  [cyan]list[/] [--source hub|builtin] List installed skills\n"
+        "  [cyan]list[/] [--source hub|builtin|local] List installed skills\n"
+        "  [cyan]check[/] [name]                Check hub skills for upstream updates\n"
+        "  [cyan]update[/] [name]               Update hub skills with upstream changes\n"
         "  [cyan]audit[/] [name]                Re-scan hub skills for security\n"
         "  [cyan]uninstall[/] <name>            Remove a hub-installed skill\n"
         "  [cyan]publish[/] <path> --repo <r>   Publish a skill to GitHub via PR\n"

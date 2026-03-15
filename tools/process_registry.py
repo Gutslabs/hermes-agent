@@ -11,7 +11,7 @@ Tracks processes spawned via terminal(background=true), providing:
 
 Background processes execute THROUGH the environment interface -- nothing
 runs on the host machine unless TERMINAL_ENV=local. For Docker, Singularity,
-Modal, and SSH backends, the command runs inside the sandbox.
+Modal, Daytona, and SSH backends, the command runs inside the sandbox.
 
 Usage:
     from tools.process_registry import process_registry
@@ -42,16 +42,18 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell
+from tools.environments.local import _find_shell, _HERMES_PROVIDER_ENV_BLOCKLIST
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
 
 # Checkpoint file for crash recovery (gateway only)
-CHECKPOINT_PATH = Path(os.path.expanduser("~/.hermes/processes.json"))
+CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -148,11 +150,16 @@ class ProcessRegistry:
         if use_pty:
             # Try PTY mode for interactive CLI tools
             try:
-                import ptyprocess
+                if _IS_WINDOWS:
+                    from winpty import PtyProcess as _PtyProcessCls
+                else:
+                    from ptyprocess import PtyProcess as _PtyProcessCls
                 user_shell = _find_shell()
-                pty_env = os.environ | (env_vars or {})
+                pty_env = {k: v for k, v in os.environ.items()
+                           if k not in _HERMES_PROVIDER_ENV_BLOCKLIST}
+                pty_env.update(env_vars or {})
                 pty_env["PYTHONUNBUFFERED"] = "1"
-                pty_proc = ptyprocess.PtyProcess.spawn(
+                pty_proc = _PtyProcessCls.spawn(
                     [user_shell, "-lic", command],
                     cwd=session.cwd,
                     env=pty_env,
@@ -191,7 +198,9 @@ class ProcessRegistry:
         # Force unbuffered output for Python scripts so progress is visible
         # during background execution (libraries like tqdm/datasets buffer when
         # stdout is a pipe, hiding output from process(action="poll")).
-        bg_env = os.environ | (env_vars or {})
+        bg_env = {k: v for k, v in os.environ.items()
+                  if k not in _HERMES_PROVIDER_ENV_BLOCKLIST}
+        bg_env.update(env_vars or {})
         bg_env["PYTHONUNBUFFERED"] = "1"
         proc = subprocess.Popen(
             [user_shell, "-lic", command],
@@ -238,7 +247,7 @@ class ProcessRegistry:
         """
         Spawn a background process through a non-local environment backend.
 
-        For Docker/Singularity/Modal/SSH: runs the command inside the sandbox
+        For Docker/Singularity/Modal/Daytona/SSH: runs the command inside the sandbox
         using the environment's execute() interface. We wrap the command to
         capture the in-sandbox PID and redirect output to a log file inside
         the sandbox, then poll the log via subsequent execute() calls.
@@ -690,7 +699,7 @@ class ProcessRegistry:
     # ----- Checkpoint (crash recovery) -----
 
     def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file."""
+        """Write running process metadata to checkpoint file atomically."""
         try:
             with self._lock:
                 entries = []
@@ -705,12 +714,12 @@ class ProcessRegistry:
                             "task_id": s.task_id,
                             "session_key": s.session_key,
                         })
-            CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
-            CHECKPOINT_PATH.write_text(
-                json.dumps(entries, indent=2), encoding="utf-8"
-            )
-        except Exception:
-            pass  # Best-effort
+            
+            # Atomic write to avoid corruption on crash
+            from utils import atomic_json_write
+            atomic_json_write(CHECKPOINT_PATH, entries)
+        except Exception as e:
+            logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -758,9 +767,10 @@ class ProcessRegistry:
 
         # Clear the checkpoint (will be rewritten as processes finish)
         try:
-            CHECKPOINT_PATH.write_text("[]", encoding="utf-8")
+            from utils import atomic_json_write
+            atomic_json_write(CHECKPOINT_PATH, [])
         except Exception as e:
-            logger.debug("Could not write checkpoint file: %s", e)
+            logger.debug("Could not clear checkpoint file: %s", e, exc_info=True)
 
         return recovered
 
@@ -823,7 +833,8 @@ def _handle_process(args, **kw):
     import json as _json
     task_id = kw.get("task_id")
     action = args.get("action", "")
-    session_id = args.get("session_id", "")
+    # Coerce to string — some models send session_id as an integer
+    session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
     if action == "list":
         return _json.dumps({"processes": process_registry.list_sessions(task_id=task_id)}, ensure_ascii=False)
@@ -840,9 +851,9 @@ def _handle_process(args, **kw):
         elif action == "kill":
             return _json.dumps(process_registry.kill_process(session_id), ensure_ascii=False)
         elif action == "write":
-            return _json.dumps(process_registry.write_stdin(session_id, args.get("data", "")), ensure_ascii=False)
+            return _json.dumps(process_registry.write_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
         elif action == "submit":
-            return _json.dumps(process_registry.submit_stdin(session_id, args.get("data", "")), ensure_ascii=False)
+            return _json.dumps(process_registry.submit_stdin(session_id, str(args.get("data", ""))), ensure_ascii=False)
     return _json.dumps({"error": f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit"}, ensure_ascii=False)
 
 

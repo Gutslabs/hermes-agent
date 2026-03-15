@@ -21,8 +21,11 @@ import os
 import shutil
 import stat
 import base64
+import hashlib
 import subprocess
+import threading
 import time
+import uuid
 import webbrowser
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -42,6 +45,10 @@ try:
     import fcntl
 except Exception:
     fcntl = None
+try:
+    import msvcrt
+except Exception:
+    msvcrt = None
 
 # =============================================================================
 # Constants
@@ -70,15 +77,19 @@ CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS = 120
 
 @dataclass
 class ProviderConfig:
-    """Describes a known OAuth provider."""
+    """Describes a known inference provider."""
     id: str
     name: str
-    auth_type: str  # "oauth_device_code" or "api_key"
+    auth_type: str  # "oauth_device_code", "oauth_external", or "api_key"
     portal_base_url: str = ""
     inference_base_url: str = ""
     client_id: str = ""
     scope: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
+    # For API-key providers: env vars to check (in priority order)
+    api_key_env_vars: tuple = ()
+    # Optional env var for base URL override
+    base_url_env_var: str = ""
 
 
 PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
@@ -97,7 +108,123 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="oauth_external",
         inference_base_url=DEFAULT_CODEX_BASE_URL,
     ),
+    "zai": ProviderConfig(
+        id="zai",
+        name="Z.AI / GLM",
+        auth_type="api_key",
+        inference_base_url="https://api.z.ai/api/paas/v4",
+        api_key_env_vars=("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"),
+        base_url_env_var="GLM_BASE_URL",
+    ),
+    "kimi-coding": ProviderConfig(
+        id="kimi-coding",
+        name="Kimi / Moonshot",
+        auth_type="api_key",
+        inference_base_url="https://api.moonshot.ai/v1",
+        api_key_env_vars=("KIMI_API_KEY",),
+        base_url_env_var="KIMI_BASE_URL",
+    ),
+    "minimax": ProviderConfig(
+        id="minimax",
+        name="MiniMax",
+        auth_type="api_key",
+        inference_base_url="https://api.minimax.io/v1",
+        api_key_env_vars=("MINIMAX_API_KEY",),
+        base_url_env_var="MINIMAX_BASE_URL",
+    ),
+    "anthropic": ProviderConfig(
+        id="anthropic",
+        name="Anthropic",
+        auth_type="api_key",
+        inference_base_url="https://api.anthropic.com",
+        api_key_env_vars=("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+    ),
+    "minimax-cn": ProviderConfig(
+        id="minimax-cn",
+        name="MiniMax (China)",
+        auth_type="api_key",
+        inference_base_url="https://api.minimaxi.com/v1",
+        api_key_env_vars=("MINIMAX_CN_API_KEY",),
+        base_url_env_var="MINIMAX_CN_BASE_URL",
+    ),
 }
+
+
+# =============================================================================
+# Kimi Code Endpoint Detection
+# =============================================================================
+
+# Kimi Code (platform.kimi.ai) issues keys prefixed "sk-kimi-" that only work
+# on api.kimi.com/coding/v1.  Legacy keys from platform.moonshot.ai work on
+# api.moonshot.ai/v1 (the default).  Auto-detect when user hasn't set
+# KIMI_BASE_URL explicitly.
+KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
+
+
+def _resolve_kimi_base_url(api_key: str, default_url: str, env_override: str) -> str:
+    """Return the correct Kimi base URL based on the API key prefix.
+
+    If the user has explicitly set KIMI_BASE_URL, that always wins.
+    Otherwise, sk-kimi- prefixed keys route to api.kimi.com/coding/v1.
+    """
+    if env_override:
+        return env_override
+    if api_key.startswith("sk-kimi-"):
+        return KIMI_CODE_BASE_URL
+    return default_url
+
+
+# =============================================================================
+# Z.AI Endpoint Detection
+# =============================================================================
+
+# Z.AI has separate billing for general vs coding plans, and global vs China
+# endpoints.  A key that works on one may return "Insufficient balance" on
+# another.  We probe at setup time and store the working endpoint.
+
+ZAI_ENDPOINTS = [
+    # (id, base_url, default_model, label)
+    ("global",        "https://api.z.ai/api/paas/v4",        "glm-5",   "Global"),
+    ("cn",            "https://open.bigmodel.cn/api/paas/v4", "glm-5",   "China"),
+    ("coding-global", "https://api.z.ai/api/coding/paas/v4",  "glm-4.7", "Global (Coding Plan)"),
+    ("coding-cn",     "https://open.bigmodel.cn/api/coding/paas/v4", "glm-4.7", "China (Coding Plan)"),
+]
+
+
+def detect_zai_endpoint(api_key: str, timeout: float = 8.0) -> Optional[Dict[str, str]]:
+    """Probe z.ai endpoints to find one that accepts this API key.
+
+    Returns {"id": ..., "base_url": ..., "model": ..., "label": ...} for the
+    first working endpoint, or None if all fail.
+    """
+    for ep_id, base_url, model, label in ZAI_ENDPOINTS:
+        try:
+            resp = httpx.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": model,
+                    "stream": False,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                },
+                timeout=timeout,
+            )
+            if resp.status_code == 200:
+                logger.debug("Z.AI endpoint probe: %s (%s) OK", ep_id, base_url)
+                return {
+                    "id": ep_id,
+                    "base_url": base_url,
+                    "model": model,
+                    "label": label,
+                }
+            logger.debug("Z.AI endpoint probe: %s returned %s", ep_id, resp.status_code)
+        except Exception as exc:
+            logger.debug("Z.AI endpoint probe: %s failed: %s", ep_id, exc)
+    return None
 
 
 # =============================================================================
@@ -147,6 +274,31 @@ def format_auth_error(error: Exception) -> str:
     return str(error)
 
 
+def _token_fingerprint(token: Any) -> Optional[str]:
+    """Return a short hash fingerprint for telemetry without leaking token bytes."""
+    if not isinstance(token, str):
+        return None
+    cleaned = token.strip()
+    if not cleaned:
+        return None
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:12]
+
+
+def _oauth_trace_enabled() -> bool:
+    raw = os.getenv("HERMES_OAUTH_TRACE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any) -> None:
+    if not _oauth_trace_enabled():
+        return
+    payload: Dict[str, Any] = {"event": event}
+    if sequence_id:
+        payload["sequence_id"] = sequence_id
+    payload.update(fields)
+    logger.info("oauth_trace %s", json.dumps(payload, sort_keys=True, ensure_ascii=False))
+
+
 # =============================================================================
 # Auth Store — persistence layer for ~/.hermes/auth.json
 # =============================================================================
@@ -159,31 +311,64 @@ def _auth_lock_path() -> Path:
     return _auth_file_path().with_suffix(".lock")
 
 
+_auth_lock_holder = threading.local()
+
 @contextmanager
 def _auth_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
-    """Cross-process advisory lock for auth.json reads+writes."""
+    """Cross-process advisory lock for auth.json reads+writes.  Reentrant."""
+    # Reentrant: if this thread already holds the lock, just yield.
+    if getattr(_auth_lock_holder, "depth", 0) > 0:
+        _auth_lock_holder.depth += 1
+        try:
+            yield
+        finally:
+            _auth_lock_holder.depth -= 1
+        return
+
     lock_path = _auth_lock_path()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with lock_path.open("a+") as lock_file:
-        if fcntl is None:
+    if fcntl is None and msvcrt is None:
+        _auth_lock_holder.depth = 1
+        try:
             yield
-            return
+        finally:
+            _auth_lock_holder.depth = 0
+        return
 
+    # On Windows, msvcrt.locking needs the file to have content and the
+    # file pointer at position 0.  Ensure the lock file has at least 1 byte.
+    if msvcrt and (not lock_path.exists() or lock_path.stat().st_size == 0):
+        lock_path.write_text(" ", encoding="utf-8")
+
+    with lock_path.open("r+" if msvcrt else "a+") as lock_file:
         deadline = time.time() + max(1.0, timeout_seconds)
         while True:
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if fcntl:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
                 break
-            except BlockingIOError:
+            except (BlockingIOError, OSError, PermissionError):
                 if time.time() >= deadline:
                     raise TimeoutError("Timed out waiting for auth store lock")
                 time.sleep(0.05)
 
+        _auth_lock_holder.depth = 1
         try:
             yield
         finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            _auth_lock_holder.depth = 0
+            if fcntl:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            elif msvcrt:
+                try:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                except (OSError, IOError):
+                    pass
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
@@ -216,7 +401,29 @@ def _save_auth_store(auth_store: Dict[str, Any]) -> Path:
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
-    auth_file.write_text(json.dumps(auth_store, indent=2) + "\n")
+    payload = json.dumps(auth_store, indent=2) + "\n"
+    tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, auth_file)
+        try:
+            dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
+        except OSError:
+            dir_fd = None
+        if dir_fd is not None:
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
     # Restrict file permissions to owner only
     try:
         auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
@@ -306,9 +513,19 @@ def resolve_provider(
     1. active_provider in auth.json with valid credentials
     2. Explicit CLI api_key/base_url -> "openrouter"
     3. OPENAI_API_KEY or OPENROUTER_API_KEY env vars -> "openrouter"
-    4. Fallback: "openrouter"
+    4. Provider-specific API keys (GLM, Kimi, MiniMax) -> that provider
+    5. Fallback: "openrouter"
     """
     normalized = (requested or "auto").strip().lower()
+
+    # Normalize provider aliases
+    _PROVIDER_ALIASES = {
+        "glm": "zai", "z-ai": "zai", "z.ai": "zai", "zhipu": "zai",
+        "kimi": "kimi-coding", "moonshot": "kimi-coding",
+        "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
+        "claude": "anthropic", "claude-code": "anthropic",
+    }
+    normalized = _PROVIDER_ALIASES.get(normalized, normalized)
 
     if normalized in {"openrouter", "custom"}:
         return "openrouter"
@@ -337,6 +554,14 @@ def resolve_provider(
 
     if os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY"):
         return "openrouter"
+
+    # Auto-detect API-key providers by checking their env vars
+    for pid, pconfig in PROVIDER_REGISTRY.items():
+        if pconfig.auth_type != "api_key":
+            continue
+        for env_var in pconfig.api_key_env_vars:
+            if os.getenv(env_var, "").strip():
+                return pid
 
     return "openrouter"
 
@@ -877,6 +1102,19 @@ def fetch_nous_models(
                 continue
             model_ids.append(mid)
 
+    # Sort: prefer opus > pro > haiku/flash > sonnet (sonnet is cheap/fast,
+    # users who want the best model should see opus first).
+    def _model_priority(mid: str) -> tuple:
+        low = mid.lower()
+        if "opus" in low:
+            return (0, mid)
+        if "pro" in low and "sonnet" not in low:
+            return (1, mid)
+        if "sonnet" in low:
+            return (3, mid)
+        return (2, mid)
+
+    model_ids.sort(key=_model_priority)
     return list(dict.fromkeys(model_ids))
 
 
@@ -906,6 +1144,7 @@ def resolve_nous_runtime_credentials(
     expires_in, source ("cache" or "portal").
     """
     min_key_ttl_seconds = max(60, int(min_key_ttl_seconds))
+    sequence_id = uuid.uuid4().hex[:12]
 
     with _auth_store_lock():
         auth_store = _load_auth_store()
@@ -928,8 +1167,35 @@ def resolve_nous_runtime_credentials(
         ).rstrip("/")
         client_id = str(state.get("client_id") or DEFAULT_NOUS_CLIENT_ID)
 
+        def _persist_state(reason: str) -> None:
+            try:
+                _save_provider_state(auth_store, "nous", state)
+                _save_auth_store(auth_store)
+            except Exception as exc:
+                _oauth_trace(
+                    "nous_state_persist_failed",
+                    sequence_id=sequence_id,
+                    reason=reason,
+                    error_type=type(exc).__name__,
+                )
+                raise
+            _oauth_trace(
+                "nous_state_persisted",
+                sequence_id=sequence_id,
+                reason=reason,
+                refresh_token_fp=_token_fingerprint(state.get("refresh_token")),
+                access_token_fp=_token_fingerprint(state.get("access_token")),
+            )
+
         verify = _resolve_verify(insecure=insecure, ca_bundle=ca_bundle, auth_state=state)
         timeout = httpx.Timeout(timeout_seconds if timeout_seconds else 15.0)
+        _oauth_trace(
+            "nous_runtime_credentials_start",
+            sequence_id=sequence_id,
+            force_mint=bool(force_mint),
+            min_key_ttl_seconds=min_key_ttl_seconds,
+            refresh_token_fp=_token_fingerprint(state.get("refresh_token")),
+        )
 
         with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
             access_token = state.get("access_token")
@@ -945,12 +1211,19 @@ def resolve_nous_runtime_credentials(
                     raise AuthError("Session expired and no refresh token is available.",
                                     provider="nous", relogin_required=True)
 
+                _oauth_trace(
+                    "refresh_start",
+                    sequence_id=sequence_id,
+                    reason="access_expiring",
+                    refresh_token_fp=_token_fingerprint(refresh_token),
+                )
                 refreshed = _refresh_access_token(
                     client=client, portal_base_url=portal_base_url,
                     client_id=client_id, refresh_token=refresh_token,
                 )
                 now = datetime.now(timezone.utc)
                 access_ttl = _coerce_ttl_seconds(refreshed.get("expires_in"))
+                previous_refresh_token = refresh_token
                 state["access_token"] = refreshed["access_token"]
                 state["refresh_token"] = refreshed.get("refresh_token") or refresh_token
                 state["token_type"] = refreshed.get("token_type") or state.get("token_type") or "Bearer"
@@ -964,6 +1237,16 @@ def resolve_nous_runtime_credentials(
                     now.timestamp() + access_ttl, tz=timezone.utc
                 ).isoformat()
                 access_token = state["access_token"]
+                refresh_token = state["refresh_token"]
+                _oauth_trace(
+                    "refresh_success",
+                    sequence_id=sequence_id,
+                    reason="access_expiring",
+                    previous_refresh_token_fp=_token_fingerprint(previous_refresh_token),
+                    new_refresh_token_fp=_token_fingerprint(refresh_token),
+                )
+                # Persist immediately so downstream mint failures cannot drop rotated refresh tokens.
+                _persist_state("post_refresh_access_expiring")
 
             # Step 2: mint agent key if missing/expiring
             used_cached_key = False
@@ -971,23 +1254,45 @@ def resolve_nous_runtime_credentials(
 
             if not force_mint and _agent_key_is_usable(state, min_key_ttl_seconds):
                 used_cached_key = True
+                _oauth_trace("agent_key_reuse", sequence_id=sequence_id)
             else:
                 try:
+                    _oauth_trace(
+                        "mint_start",
+                        sequence_id=sequence_id,
+                        access_token_fp=_token_fingerprint(access_token),
+                    )
                     mint_payload = _mint_agent_key(
                         client=client, portal_base_url=portal_base_url,
                         access_token=access_token, min_ttl_seconds=min_key_ttl_seconds,
                     )
                 except AuthError as exc:
+                    _oauth_trace(
+                        "mint_error",
+                        sequence_id=sequence_id,
+                        code=exc.code,
+                    )
                     # Retry path: access token may be stale server-side despite local checks
-                    if exc.code in {"invalid_token", "invalid_grant"} and isinstance(refresh_token, str) and refresh_token:
+                    latest_refresh_token = state.get("refresh_token")
+                    if (
+                        exc.code in {"invalid_token", "invalid_grant"}
+                        and isinstance(latest_refresh_token, str)
+                        and latest_refresh_token
+                    ):
+                        _oauth_trace(
+                            "refresh_start",
+                            sequence_id=sequence_id,
+                            reason="mint_retry_after_invalid_token",
+                            refresh_token_fp=_token_fingerprint(latest_refresh_token),
+                        )
                         refreshed = _refresh_access_token(
                             client=client, portal_base_url=portal_base_url,
-                            client_id=client_id, refresh_token=refresh_token,
+                            client_id=client_id, refresh_token=latest_refresh_token,
                         )
                         now = datetime.now(timezone.utc)
                         access_ttl = _coerce_ttl_seconds(refreshed.get("expires_in"))
                         state["access_token"] = refreshed["access_token"]
-                        state["refresh_token"] = refreshed.get("refresh_token") or refresh_token
+                        state["refresh_token"] = refreshed.get("refresh_token") or latest_refresh_token
                         state["token_type"] = refreshed.get("token_type") or state.get("token_type") or "Bearer"
                         state["scope"] = refreshed.get("scope") or state.get("scope")
                         refreshed_url = _optional_base_url(refreshed.get("inference_base_url"))
@@ -999,6 +1304,16 @@ def resolve_nous_runtime_credentials(
                             now.timestamp() + access_ttl, tz=timezone.utc
                         ).isoformat()
                         access_token = state["access_token"]
+                        refresh_token = state["refresh_token"]
+                        _oauth_trace(
+                            "refresh_success",
+                            sequence_id=sequence_id,
+                            reason="mint_retry_after_invalid_token",
+                            previous_refresh_token_fp=_token_fingerprint(latest_refresh_token),
+                            new_refresh_token_fp=_token_fingerprint(refresh_token),
+                        )
+                        # Persist retry refresh immediately for crash safety and cross-process visibility.
+                        _persist_state("post_refresh_mint_retry")
 
                         mint_payload = _mint_agent_key(
                             client=client, portal_base_url=portal_base_url,
@@ -1018,6 +1333,11 @@ def resolve_nous_runtime_credentials(
                 minted_url = _optional_base_url(mint_payload.get("inference_base_url"))
                 if minted_url:
                     inference_base_url = minted_url
+                _oauth_trace(
+                    "mint_success",
+                    sequence_id=sequence_id,
+                    reused=bool(mint_payload.get("reused", False)),
+                )
 
             # Persist routing and TLS metadata for non-interactive refresh/mint
             state["portal_base_url"] = portal_base_url
@@ -1028,8 +1348,7 @@ def resolve_nous_runtime_credentials(
                 "ca_bundle": verify if isinstance(verify, str) else None,
             }
 
-        _save_provider_state(auth_store, "nous", state)
-        _save_auth_store(auth_store)
+        _persist_state("resolve_nous_runtime_credentials_final")
 
     api_key = state.get("agent_key")
     if not isinstance(api_key, str) or not api_key:
@@ -1100,6 +1419,42 @@ def get_codex_auth_status() -> Dict[str, Any]:
         }
 
 
+def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
+    """Status snapshot for API-key providers (z.ai, Kimi, MiniMax)."""
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "api_key":
+        return {"configured": False}
+
+    api_key = ""
+    key_source = ""
+    for env_var in pconfig.api_key_env_vars:
+        val = os.getenv(env_var, "").strip()
+        if val:
+            api_key = val
+            key_source = env_var
+            break
+
+    env_url = ""
+    if pconfig.base_url_env_var:
+        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+
+    if provider_id == "kimi-coding":
+        base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
+    elif env_url:
+        base_url = env_url
+    else:
+        base_url = pconfig.inference_base_url
+
+    return {
+        "configured": bool(api_key),
+        "provider": provider_id,
+        "name": pconfig.name,
+        "key_source": key_source,
+        "base_url": base_url,
+        "logged_in": bool(api_key),  # compat with OAuth status shape
+    }
+
+
 def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Generic auth status dispatcher."""
     target = provider_id or get_active_provider()
@@ -1107,7 +1462,52 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_nous_auth_status()
     if target == "openai-codex":
         return get_codex_auth_status()
+    # API-key providers
+    pconfig = PROVIDER_REGISTRY.get(target)
+    if pconfig and pconfig.auth_type == "api_key":
+        return get_api_key_provider_status(target)
     return {"logged_in": False}
+
+
+def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
+    """Resolve API key and base URL for an API-key provider.
+
+    Returns dict with: provider, api_key, base_url, source.
+    """
+    pconfig = PROVIDER_REGISTRY.get(provider_id)
+    if not pconfig or pconfig.auth_type != "api_key":
+        raise AuthError(
+            f"Provider '{provider_id}' is not an API-key provider.",
+            provider=provider_id,
+            code="invalid_provider",
+        )
+
+    api_key = ""
+    key_source = ""
+    for env_var in pconfig.api_key_env_vars:
+        val = os.getenv(env_var, "").strip()
+        if val:
+            api_key = val
+            key_source = env_var
+            break
+
+    env_url = ""
+    if pconfig.base_url_env_var:
+        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+
+    if provider_id == "kimi-coding":
+        base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
+    elif env_url:
+        base_url = env_url.rstrip("/")
+    else:
+        base_url = pconfig.inference_base_url
+
+    return {
+        "provider": provider_id,
+        "api_key": api_key,
+        "base_url": base_url.rstrip("/"),
+        "source": key_source or "default",
+    }
 
 
 # =============================================================================
@@ -1141,8 +1541,20 @@ def detect_external_credentials() -> List[Dict[str, Any]]:
 # CLI Commands — login / logout
 # =============================================================================
 
-def _update_config_for_provider(provider_id: str, inference_base_url: str) -> Path:
-    """Update config.yaml and auth.json to reflect the active provider."""
+def _update_config_for_provider(
+    provider_id: str,
+    inference_base_url: str,
+    default_model: Optional[str] = None,
+) -> Path:
+    """Update config.yaml and auth.json to reflect the active provider.
+
+    When *default_model* is provided the function also writes it as the
+    ``model.default`` value.  This prevents a race condition where the
+    gateway (which re-reads config per-message) picks up the new provider
+    before the caller has finished model selection, resulting in a
+    mismatched model/provider (e.g. ``anthropic/claude-opus-4.6`` sent to
+    MiniMax's API).
+    """
     # Set active_provider in auth.json so auto-resolution picks this provider
     with _auth_store_lock():
         auth_store = _load_auth_store()
@@ -1171,7 +1583,20 @@ def _update_config_for_provider(provider_id: str, inference_base_url: str) -> Pa
         model_cfg = {}
 
     model_cfg["provider"] = provider_id
-    model_cfg["base_url"] = inference_base_url.rstrip("/")
+    if inference_base_url and inference_base_url.strip():
+        model_cfg["base_url"] = inference_base_url.rstrip("/")
+    else:
+        # Clear stale base_url to prevent contamination when switching providers
+        model_cfg.pop("base_url", None)
+
+    # When switching to a non-OpenRouter provider, ensure model.default is
+    # valid for the new provider.  An OpenRouter-formatted name like
+    # "anthropic/claude-opus-4.6" will fail on direct-API providers.
+    if default_model:
+        cur_default = model_cfg.get("default", "")
+        if not cur_default or "/" in cur_default:
+            model_cfg["default"] = default_model
+
     config["model"] = model_cfg
 
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
@@ -1279,17 +1704,20 @@ def _prompt_model_selection(model_ids: List[str], current_model: str = "") -> Op
 
 
 def _save_model_choice(model_id: str) -> None:
-    """Save the selected model to config.yaml and .env."""
-    from hermes_cli.config import save_config, load_config, save_env_value
+    """Save the selected model to config.yaml (single source of truth).
+
+    The model is stored in config.yaml only — NOT in .env.  This avoids
+    conflicts in multi-agent setups where env vars would stomp each other.
+    """
+    from hermes_cli.config import save_config, load_config
 
     config = load_config()
-    # Handle both string and dict model formats
+    # Always use dict format so provider/base_url can be stored alongside
     if isinstance(config.get("model"), dict):
         config["model"]["default"] = model_id
     else:
-        config["model"] = model_id
+        config["model"] = {"default": model_id}
     save_config(config)
-    save_env_value("LLM_MODEL", model_id)
 
 
 def login_command(args) -> None:

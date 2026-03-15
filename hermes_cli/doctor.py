@@ -33,6 +33,54 @@ os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
 from hermes_cli.colors import Colors, color
 from hermes_constants import OPENROUTER_MODELS_URL
 
+
+_PROVIDER_ENV_HINTS = (
+    "OPENROUTER_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_TOKEN",
+    "OPENAI_BASE_URL",
+    "GLM_API_KEY",
+    "ZAI_API_KEY",
+    "Z_AI_API_KEY",
+    "KIMI_API_KEY",
+    "MINIMAX_API_KEY",
+    "MINIMAX_CN_API_KEY",
+)
+
+
+def _has_provider_env_config(content: str) -> bool:
+    """Return True when ~/.hermes/.env contains provider auth/base URL settings."""
+    return any(key in content for key in _PROVIDER_ENV_HINTS)
+
+
+def _honcho_is_configured_for_doctor() -> bool:
+    """Return True when Honcho is configured, even if this process has no active session."""
+    try:
+        from honcho_integration.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig.from_global_config()
+        return bool(cfg.enabled and cfg.api_key)
+    except Exception:
+        return False
+
+
+def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
+    """Adjust runtime-gated tool availability for doctor diagnostics."""
+    if not _honcho_is_configured_for_doctor():
+        return available, unavailable
+
+    updated_available = list(available)
+    updated_unavailable = []
+    for item in unavailable:
+        if item.get("name") == "honcho":
+            if "honcho" not in updated_available:
+                updated_available.append("honcho")
+            continue
+        updated_unavailable.append(item)
+    return updated_available, updated_unavailable
+
+
 def check_ok(text: str, detail: str = ""):
     print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
 
@@ -46,9 +94,46 @@ def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
 
 
+def _check_gateway_service_linger(issues: list[str]) -> None:
+    """Warn when a systemd user gateway service will stop after logout."""
+    try:
+        from hermes_cli.gateway import (
+            get_systemd_linger_status,
+            get_systemd_unit_path,
+            is_linux,
+        )
+    except Exception as e:
+        check_warn("Gateway service linger", f"(could not import gateway helpers: {e})")
+        return
+
+    if not is_linux():
+        return
+
+    unit_path = get_systemd_unit_path()
+    if not unit_path.exists():
+        return
+
+    print()
+    print(color("◆ Gateway Service", Colors.CYAN, Colors.BOLD))
+
+    linger_enabled, linger_detail = get_systemd_linger_status()
+    if linger_enabled is True:
+        check_ok("Systemd linger enabled", "(gateway service survives logout)")
+    elif linger_enabled is False:
+        check_warn("Systemd linger disabled", "(gateway may stop after logout)")
+        check_info("Run: sudo loginctl enable-linger $USER")
+        issues.append("Enable linger for the gateway user service: sudo loginctl enable-linger $USER")
+    else:
+        check_warn("Could not verify systemd linger", f"({linger_detail})")
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
+
+    # Doctor runs from the interactive CLI, so CLI-gated tool availability
+    # checks (like cronjob management) should see the same context as `hermes`.
+    os.environ.setdefault("HERMES_INTERACTIVE", "1")
     
     issues = []
     manual_issues = []  # issues that can't be auto-fixed
@@ -132,8 +217,8 @@ def run_doctor(args):
         
         # Check for common issues
         content = env_path.read_text()
-        if "OPENROUTER_API_KEY" in content or "ANTHROPIC_API_KEY" in content:
-            check_ok("API key configured")
+        if _has_provider_env_config(content):
+            check_ok("API key or custom endpoint configured")
         else:
             check_warn("No API key found in ~/.hermes/.env")
             issues.append("Run 'hermes setup' to configure API keys")
@@ -296,6 +381,8 @@ def run_doctor(args):
             check_warn(f"~/.hermes/state.db exists but has issues: {e}")
     else:
         check_info("~/.hermes/state.db not created yet (will be created on first session)")
+
+    _check_gateway_service_linger(issues)
     
     # =========================================================================
     # Check: External tools
@@ -355,6 +442,21 @@ def run_doctor(args):
             check_fail("TERMINAL_SSH_HOST not set", "(required for TERMINAL_ENV=ssh)")
             issues.append("Set TERMINAL_SSH_HOST in .env")
     
+    # Daytona (if using daytona backend)
+    if terminal_env == "daytona":
+        daytona_key = os.getenv("DAYTONA_API_KEY")
+        if daytona_key:
+            check_ok("Daytona API key", "(configured)")
+        else:
+            check_fail("DAYTONA_API_KEY not set", "(required for TERMINAL_ENV=daytona)")
+            issues.append("Set DAYTONA_API_KEY environment variable")
+        try:
+            from daytona import Daytona
+            check_ok("daytona SDK", "(installed)")
+        except ImportError:
+            check_fail("daytona SDK not installed", "(pip install daytona)")
+            issues.append("Install daytona SDK: pip install daytona")
+
     # Node.js + agent-browser (for browser automation tools)
     if shutil.which("node"):
         check_ok("Node.js")
@@ -431,17 +533,22 @@ def run_doctor(args):
     else:
         check_warn("OpenRouter API", "(not configured)")
     
-    anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+    anthropic_key = os.getenv("ANTHROPIC_TOKEN") or os.getenv("ANTHROPIC_API_KEY")
     if anthropic_key:
         print("  Checking Anthropic API...", end="", flush=True)
         try:
             import httpx
+            from agent.anthropic_adapter import _is_oauth_token, _COMMON_BETAS, _OAUTH_ONLY_BETAS
+
+            headers = {"anthropic-version": "2023-06-01"}
+            if _is_oauth_token(anthropic_key):
+                headers["Authorization"] = f"Bearer {anthropic_key}"
+                headers["anthropic-beta"] = ",".join(_COMMON_BETAS + _OAUTH_ONLY_BETAS)
+            else:
+                headers["x-api-key"] = anthropic_key
             response = httpx.get(
                 "https://api.anthropic.com/v1/models",
-                headers={
-                    "x-api-key": anthropic_key,
-                    "anthropic-version": "2023-06-01"
-                },
+                headers=headers,
                 timeout=10
             )
             if response.status_code == 200:
@@ -453,7 +560,55 @@ def run_doctor(args):
                 print(f"\r  {color('⚠', Colors.YELLOW)} Anthropic API {color(msg, Colors.DIM)}                 ")
         except Exception as e:
             print(f"\r  {color('⚠', Colors.YELLOW)} Anthropic API {color(f'({e})', Colors.DIM)}                 ")
-    
+
+    # -- API-key providers (Z.AI/GLM, Kimi, MiniMax, MiniMax-CN) --
+    # Tuple: (name, env_vars, default_url, base_env, supports_models_endpoint)
+    # If supports_models_endpoint is False, we skip the health check and just show "configured"
+    _apikey_providers = [
+        ("Z.AI / GLM",      ("GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY"), "https://api.z.ai/api/paas/v4/models", "GLM_BASE_URL", True),
+        ("Kimi / Moonshot",  ("KIMI_API_KEY",),                              "https://api.moonshot.ai/v1/models",   "KIMI_BASE_URL", True),
+        # MiniMax APIs don't support /models endpoint — https://github.com/NousResearch/hermes-agent/issues/811
+        ("MiniMax",          ("MINIMAX_API_KEY",),                            None,                                  "MINIMAX_BASE_URL", False),
+        ("MiniMax (China)",  ("MINIMAX_CN_API_KEY",),                         None,                                  "MINIMAX_CN_BASE_URL", False),
+    ]
+    for _pname, _env_vars, _default_url, _base_env, _supports_health_check in _apikey_providers:
+        _key = ""
+        for _ev in _env_vars:
+            _key = os.getenv(_ev, "")
+            if _key:
+                break
+        if _key:
+            _label = _pname.ljust(20)
+            # Some providers (like MiniMax) don't support /models endpoint
+            if not _supports_health_check:
+                print(f"  {color('✓', Colors.GREEN)} {_label} {color('(key configured)', Colors.DIM)}")
+                continue
+            print(f"  Checking {_pname} API...", end="", flush=True)
+            try:
+                import httpx
+                _base = os.getenv(_base_env, "")
+                # Auto-detect Kimi Code keys (sk-kimi-) → api.kimi.com
+                if not _base and _key.startswith("sk-kimi-"):
+                    _base = "https://api.kimi.com/coding/v1"
+                _url = (_base.rstrip("/") + "/models") if _base else _default_url
+                _headers = {"Authorization": f"Bearer {_key}"}
+                if "api.kimi.com" in _url.lower():
+                    _headers["User-Agent"] = "KimiCLI/1.0"
+                _resp = httpx.get(
+                    _url,
+                    headers=_headers,
+                    timeout=10,
+                )
+                if _resp.status_code == 200:
+                    print(f"\r  {color('✓', Colors.GREEN)} {_label}                          ")
+                elif _resp.status_code == 401:
+                    print(f"\r  {color('✗', Colors.RED)} {_label} {color('(invalid API key)', Colors.DIM)}           ")
+                    issues.append(f"Check {_env_vars[0]} in .env")
+                else:
+                    print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'(HTTP {_resp.status_code})', Colors.DIM)}           ")
+            except Exception as _e:
+                print(f"\r  {color('⚠', Colors.YELLOW)} {_label} {color(f'({_e})', Colors.DIM)}           ")
+
     # =========================================================================
     # Check: Submodules
     # =========================================================================
@@ -499,6 +654,7 @@ def run_doctor(args):
         from model_tools import check_tool_availability, TOOLSET_REQUIREMENTS
         
         available, unavailable = check_tool_availability()
+        available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
         
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})
@@ -550,6 +706,40 @@ def run_doctor(args):
         check_ok("GitHub token configured (authenticated API access)")
     else:
         check_warn("No GITHUB_TOKEN", "(60 req/hr rate limit — set in ~/.hermes/.env for better rates)")
+
+    # =========================================================================
+    # Honcho memory
+    # =========================================================================
+    print()
+    print(color("◆ Honcho Memory", Colors.CYAN, Colors.BOLD))
+
+    try:
+        from honcho_integration.client import HonchoClientConfig, GLOBAL_CONFIG_PATH
+        hcfg = HonchoClientConfig.from_global_config()
+
+        if not GLOBAL_CONFIG_PATH.exists():
+            check_warn("Honcho config not found", f"run: hermes honcho setup")
+        elif not hcfg.enabled:
+            check_info("Honcho disabled (set enabled: true in ~/.honcho/config.json to activate)")
+        elif not hcfg.api_key:
+            check_fail("Honcho API key not set", "run: hermes honcho setup")
+            issues.append("No Honcho API key — run 'hermes honcho setup'")
+        else:
+            from honcho_integration.client import get_honcho_client, reset_honcho_client
+            reset_honcho_client()
+            try:
+                get_honcho_client(hcfg)
+                check_ok(
+                    "Honcho connected",
+                    f"workspace={hcfg.workspace_id} mode={hcfg.memory_mode} freq={hcfg.write_frequency}",
+                )
+            except Exception as _e:
+                check_fail("Honcho connection failed", str(_e))
+                issues.append(f"Honcho unreachable: {_e}")
+    except ImportError:
+        check_warn("honcho-ai not installed", "pip install honcho-ai")
+    except Exception as _e:
+        check_warn("Honcho check failed", str(_e))
 
     # =========================================================================
     # Summary
