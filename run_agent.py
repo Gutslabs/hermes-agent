@@ -82,6 +82,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     build_nous_subscription_prompt,
 )
+from agent.identity_learning import IdentityLearningStore
 from agent.model_metadata import (
     fetch_model_metadata,
     estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
@@ -92,7 +93,7 @@ from agent.model_metadata import (
 from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, load_identity_md, load_lessons_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -1068,6 +1069,19 @@ class AIAgent:
                 _tname = _schema.get("name", "")
                 if _tname:
                     self.valid_tool_names.add(_tname)
+
+        # Learned identity — reflective self-model derived from completed
+        # sessions. This never mutates SOUL.md directly; it writes profile-
+        # scoped IDENTITY.md and LESSONS.md for the next session.
+        self._identity_learning = None
+        if not skip_memory:
+            try:
+                self._identity_learning = IdentityLearningStore.from_config(
+                    _agent_cfg.get("identity_learning", {})
+                )
+            except Exception as exc:
+                logger.warning("Identity learning init failed: %s", exc)
+                self._identity_learning = None
 
         # Skills config: nudge interval for skill creation reminders
         self._skill_nudge_interval = 10
@@ -2523,6 +2537,14 @@ class AIAgent:
         manager. NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        if self._identity_learning:
+            try:
+                self._identity_learning.reflect_session(
+                    messages or [],
+                    trigger="session_end",
+                )
+            except Exception:
+                pass
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
@@ -2607,6 +2629,14 @@ class AIAgent:
         if not _soul_loaded:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
+
+        if not self.skip_context_files:
+            _identity_content = load_identity_md()
+            if _identity_content:
+                prompt_parts.append(_identity_content)
+            _lessons_content = load_lessons_md()
+            if _lessons_content:
+                prompt_parts.append(_lessons_content)
 
         # Tool-aware behavioral guidance: only inject when the tools are loaded
         tool_guidance = []

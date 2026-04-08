@@ -828,6 +828,29 @@ def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE
     return head + marker + tail
 
 
+def _load_home_markdown(filename: str) -> Optional[str]:
+    """Load a profile-scoped markdown file from HERMES_HOME."""
+    try:
+        from hermes_cli.config import ensure_hermes_home
+        ensure_hermes_home()
+    except Exception as e:
+        logger.debug("Could not ensure HERMES_HOME before loading %s: %s", filename, e)
+
+    file_path = get_hermes_home() / filename
+    if not file_path.exists():
+        return None
+    try:
+        content = file_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, filename)
+        content = _truncate_content(content, filename)
+        return content
+    except Exception as e:
+        logger.debug("Could not read %s from %s: %s", filename, file_path, e)
+        return None
+
+
 def load_soul_md() -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
@@ -835,25 +858,17 @@ def load_soul_md() -> Optional[str]:
     returns content, ``build_context_files_prompt`` should be called with
     ``skip_soul=True`` so SOUL.md isn't injected twice.
     """
-    try:
-        from hermes_cli.config import ensure_hermes_home
-        ensure_hermes_home()
-    except Exception as e:
-        logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
+    return _load_home_markdown("SOUL.md")
 
-    soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
-        return None
-    try:
-        content = soul_path.read_text(encoding="utf-8").strip()
-        if not content:
-            return None
-        content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(content, "SOUL.md")
-        return content
-    except Exception as e:
-        logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)
-        return None
+
+def load_identity_md() -> Optional[str]:
+    """Load IDENTITY.md from HERMES_HOME and return its content, or None."""
+    return _load_home_markdown("IDENTITY.md")
+
+
+def load_lessons_md() -> Optional[str]:
+    """Load LESSONS.md from HERMES_HOME and return its content, or None."""
+    return _load_home_markdown("LESSONS.md")
 
 
 def _load_hermes_md(cwd_path: Path) -> str:

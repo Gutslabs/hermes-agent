@@ -365,6 +365,13 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 30,
         },
+        "identity_reflection": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 45,
+        },
     },
     
     "display": {
@@ -448,6 +455,17 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+    },
+
+    # Identity learning — reflective self-modeling. Learns durable agent-side
+    # patterns into IDENTITY.md and LESSONS.md while leaving SOUL.md untouched.
+    "identity_learning": {
+        "enabled": False,
+        "min_turns": 4,
+        "max_transcript_chars": 12000,
+        "promote_after": 2,
+        "max_traits": 12,
+        "max_lessons": 20,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
@@ -547,7 +565,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 12,
+    "_config_version": 13,
 }
 
 # =============================================================================

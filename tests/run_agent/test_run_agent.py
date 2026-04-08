@@ -592,6 +592,30 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         assert DEFAULT_AGENT_IDENTITY in prompt
 
+    def test_includes_identity_and_lessons_layers(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch("run_agent.load_soul_md", return_value="core soul"),
+            patch("run_agent.load_identity_md", return_value="learned identity"),
+            patch("run_agent.load_lessons_md", return_value="learned lessons"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=False,
+                skip_memory=True,
+            )
+            agent.client = MagicMock()
+            prompt = agent._build_system_prompt()
+            assert "core soul" in prompt
+            assert "learned identity" in prompt
+            assert "learned lessons" in prompt
+
     def test_includes_system_message(self, agent):
         prompt = agent._build_system_prompt(system_message="Custom instruction")
         assert "Custom instruction" in prompt
@@ -617,6 +641,32 @@ class TestBuildSystemPrompt:
         monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")
         prompt = agent._build_system_prompt()
         assert "NOUS SUBSCRIPTION BLOCK" in prompt
+
+    def test_shutdown_triggers_identity_learning(self):
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("web_search"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+            patch(
+                "hermes_cli.config.load_config",
+                return_value={"identity_learning": {"enabled": True, "min_turns": 1}},
+            ),
+            patch("run_agent.IdentityLearningStore.from_config") as mock_store_factory,
+        ):
+            mock_store = MagicMock()
+            mock_store_factory.return_value = mock_store
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=False,
+            )
+            agent.shutdown_memory_provider([{"role": "user", "content": "hi"}])
+
+        mock_store.reflect_session.assert_called_once()
 
     def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
